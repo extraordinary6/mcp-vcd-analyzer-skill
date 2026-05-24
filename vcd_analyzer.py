@@ -42,7 +42,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.1.4'
+__version__ = '1.1.5'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -55,6 +55,12 @@ from collections import defaultdict
 # -- Time utilities ----------------------------------------------------------
 
 _UNITS = {'fs': 1e-15, 'ps': 1e-12, 'ns': 1e-9, 'us': 1e-6, 'ms': 1e-3, 's': 1.0}
+
+# IEEE 1364-2005 18.2.2 real value_change is 'r' + real_number where
+# real_number follows C99 printf("%g") shape: optional sign, integer and/or
+# fractional digits, optional exponent. Used to reject garbage tokens like
+# 'reset' that start with 'r' but aren't a numeric value_change.
+_REAL_RE = re.compile(r'^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$')
 
 # Extended VCD port state character → 4-state mapping (IEEE 1364-2005 18.4.3.1).
 # Strengths (driver levels 0-7) are not exposed; for RTL debug the 4-state value
@@ -76,13 +82,23 @@ def _parse_timescale(text):
     return int(m.group(1)) * _UNITS[m.group(2)] if m else 1e-12
 
 
+class _TimeParseError(ValueError):
+    """Raised by parse_time on invalid input; caught in main() for friendly CLI errors."""
+
+
 def parse_time(s, ts_sec):
     """Parse time string with optional unit suffix to internal VCD timestamp."""
     if s is None:
         return None
     m = re.match(r'^([0-9]*\.?[0-9]+)\s*(fs|ps|ns|us|ms|s)?$', s.strip())
     if not m:
-        return int(s)
+        # Fall back to bare integer ('100', '-5'); reject anything else.
+        try:
+            return int(s)
+        except (ValueError, TypeError):
+            raise _TimeParseError(
+                'invalid time value {!r}; expected integer ticks or value '
+                'with fs/ps/ns/us/ms/s suffix'.format(s))
     val, unit = float(m.group(1)), m.group(2)
     return int(val) if unit is None else int(round(val * _UNITS[unit] / ts_sec))
 
@@ -244,6 +260,16 @@ class VCDParser:
                                     continue
                             sym, name = body[2], body[3]
                             bit_str = body[4] if len(body) > 4 and body[4].startswith('[') else None
+                            # Per IEEE 1364-2005 18.2.3.7 reference syntax:
+                            #   identifier [bit_select_index]      → single bit
+                            #   identifier [msb_index : lsb_index] → range
+                            # For multi-bit refs with a range, fold it into
+                            # the name so the displayed path is 'data[7:0]'.
+                            # For w==1 with [N], keep bit_str separate for
+                            # the bit-explosion heuristic below.
+                            if bit_str is not None and w > 1:
+                                name = name + bit_str
+                                bit_str = None
                             raw_vars.append((sym, name, w, bit_str, '.'.join(scope), vtype))
                         elif current_kw == '$enddefinitions':
                             done = True
@@ -348,29 +374,20 @@ class VCDParser:
                 for t in line.split():
                     yield t
 
-    def _data_tokens_clean(self):
-        """Data section tokens with $comment/$vcdclose bodies skipped.
-
-        Per IEEE 1364-2005 18.2.3.1 and 18.3.6.1, these sections appear in
-        the data area but their content is NOT value_changes; the body must
-        not be interpreted as timestamps or value tokens.
-        """
-        toks = self._data_tokens()
-        for tok in toks:
-            if tok in _DATA_SKIP_SECTIONS:
-                for t in toks:
-                    if t == '$end':
-                        break
-                continue
-            yield tok
-
     def iter_events(self, t0=0, t1=None, sids=None):
         """Yield (time, sig_id, value_str) with bit reassembly.
 
-        Token-based. Handles inline and multi-line simulation_keyword blocks
-        per IEEE 1364-2005 18.2.3.9-12. Initial value changes appearing
-        before any '#T' timestamp are emitted at logical t=0 (typical case:
-        $dumpvars block directly after $enddefinitions without a leading #0).
+        Token-based, context-sensitive. Section keywords ($comment/$vcdclose/
+        $dumpvars/$dumpoff/$dumpon/$dumpall/$dumpports*) are only recognized
+        when the parser is at a top-level position (expecting either a
+        timestamp or a value_change opener). After 'b<bits>', 'r<num>', or
+        'p<state> <s0> <s1>' the NEXT token is consumed as identifier_code
+        even if it happens to be the string '$comment' (legal per
+        IEEE 1364-2005 18.2.1: identifier_code is any printable ASCII).
+
+        Initial value changes appearing before any '#T' timestamp are
+        emitted at logical t=0 (typical case: $dumpvars block directly
+        after $enddefinitions without a leading #0).
         """
         cur_t = 0
         pending = {}
@@ -382,12 +399,17 @@ class VCDParser:
             pending.clear()
             return items
 
-        toks = self._data_tokens_clean()
+        toks = self._data_tokens()
         for tok in toks:
-            # Section markers: simulation keywords and $end are no-ops.
-            # Their wrapped value_changes are parsed normally below.
-            # $comment and $vcdclose bodies are already filtered out by
-            # _data_tokens_clean.
+            # Top-level: section keywords vs value-change vs timestamp.
+            # Anything consumed as a "next" token after b/r/p is handled
+            # in their respective branches below, NOT here.
+            if tok in _DATA_SKIP_SECTIONS:
+                # $comment ... $end / $vcdclose ... $end: skip body
+                for t in toks:
+                    if t == '$end':
+                        break
+                continue
             if tok in _SIM_KEYWORDS or tok == '$end':
                 continue
             if tok.startswith('$'):
@@ -404,17 +426,34 @@ class VCDParser:
                 continue
 
             # Parse one value_change. May consume 1, 2, or 4 tokens.
+            # Each branch validates the body shape; malformed tokens (e.g.
+            # 'reset' starting with 'r' but not a real number) are skipped
+            # silently rather than producing fake events.
             first = tok[0]
             if first in '01xXzZ':
                 val = first.lower()
                 sym = tok[1:]
+                if not sym:
+                    continue
             elif first in 'bB':
-                val = tok[1:].lower()
+                bits = tok[1:]
+                # Body must be 0/1/x/X/z/Z only (IEEE 1364 binary_number)
+                if not bits or any(c not in '01xXzZ' for c in bits):
+                    # Consume the would-be identifier to stay aligned
+                    next(toks, None)
+                    continue
+                val = bits.lower()
                 sym = next(toks, None)
                 if sym is None:
                     break
             elif first in 'rR':
-                val = tok[1:]
+                body = tok[1:]
+                # Must look like a real number per %g format
+                if not _REAL_RE.match(body):
+                    # 'reset', 'rXYZ' etc — skip silently, consume next token
+                    next(toks, None)
+                    continue
+                val = body
                 sym = next(toks, None)
                 if sym is None:
                     break
@@ -462,11 +501,22 @@ class VCDParser:
 
     def scan_time_range(self):
         """Min/max timestamps in the file. If any value_change occurs before
-        the first #T (an initial $dumpvars block), t_min is 0.
-        $comment and $vcdclose bodies are skipped (18.2.3.1, 18.3.6.1)."""
+        the first #T (an initial $dumpvars block), t_min is 0. Time is
+        observed-max (never less than the largest seen): malformed VCDs
+        with timestamps going backwards don't produce negative duration.
+        $comment / $vcdclose bodies are skipped only when at a top-level
+        position (not when consumed as identifier_code per 18.2.1)."""
         t_min = t_max = None
         saw_initial_data = False
-        for tok in self._data_tokens_clean():
+        toks = self._data_tokens()
+        for tok in toks:
+            # Top-level section skips (context-sensitive: only when not
+            # being consumed as the symbol after b/r/p)
+            if tok in _DATA_SKIP_SECTIONS:
+                for t in toks:
+                    if t == '$end':
+                        break
+                continue
             if tok.startswith('#') and len(tok) > 1 and tok[1].isdigit():
                 try:
                     t = int(tok[1:])
@@ -474,8 +524,22 @@ class VCDParser:
                     continue
                 if t_min is None:
                     t_min = 0 if saw_initial_data else t
-                t_max = t
-            elif t_min is None and tok and tok[0] in '01xXzZbBrRp':
+                t_max = t if t_max is None else max(t_max, t)
+            elif tok and tok[0] in 'bB':
+                # Multi-bit value_change: consume the identifier (which may
+                # be '$comment' etc) without treating it as a section
+                _sym = next(toks, None)
+                if t_min is None:
+                    saw_initial_data = True
+            elif tok and tok[0] in 'rR':
+                _sym = next(toks, None)
+                if t_min is None:
+                    saw_initial_data = True
+            elif tok and tok[0] == 'p':
+                next(toks, None); next(toks, None); next(toks, None)
+                if t_min is None:
+                    saw_initial_data = True
+            elif t_min is None and tok and tok[0] in '01xXzZ':
                 saw_initial_data = True
         if t_min is None and saw_initial_data:
             t_min = t_max = 0
@@ -724,11 +788,12 @@ def cmd_compare(vcd, args):
         sys.exit('Error: --at needs two times separated by comma, e.g. --at 17.5us,17.7us')
     ta, tb = parse_time(parts[0].strip(), ts), parse_time(parts[1].strip(), ts)
     sids = vcd.match(args.filter)
+    # Build both snapshots independently from t=0 — avoids the
+    # directionality bug where --at T2,T1 (with T1<T2 already replayed)
+    # would silently report no diffs. Each snapshot is the true state at
+    # its query time regardless of ordering.
     sa = _build_snapshot(vcd, ta, sids)
-    # Continue from ta to tb for state_b
-    sb = dict(sa)
-    for t, sid, val in vcd.iter_events(ta, tb, sids):
-        sb[sid] = val
+    sb = _build_snapshot(vcd, tb, sids)
 
     diffs = []
     for sid in sorted(set(sa) | set(sb), key=lambda s: vcd.signals[s]['path']):
@@ -861,11 +926,23 @@ def main():
         p.print_help()
         sys.exit(1)
 
-    vcd = VCDParser(args.file)
-    cmds = {'info': cmd_info, 'list': cmd_list, 'dump': cmd_dump, 'summary': cmd_summary,
-            'edges': cmd_edges, 'snapshot': cmd_snapshot,
-            'compare': cmd_compare, 'search': cmd_search}
-    cmds[args.cmd](vcd, args)
+    # Friendly errors for common CLI mistakes (no Python traceback to user).
+    # Time-arg parsing happens lazily inside each cmd via parse_time(); we
+    # surface those as concise errors here.
+    try:
+        vcd = VCDParser(args.file)
+        cmds = {'info': cmd_info, 'list': cmd_list, 'dump': cmd_dump, 'summary': cmd_summary,
+                'edges': cmd_edges, 'snapshot': cmd_snapshot,
+                'compare': cmd_compare, 'search': cmd_search}
+        cmds[args.cmd](vcd, args)
+    except FileNotFoundError as e:
+        sys.exit('Error: cannot open VCD file: {}'.format(e.filename or args.file))
+    except IsADirectoryError as e:
+        sys.exit('Error: not a file: {}'.format(e.filename or args.file))
+    except PermissionError as e:
+        sys.exit('Error: permission denied: {}'.format(e.filename or args.file))
+    except _TimeParseError as e:
+        sys.exit('Error: ' + str(e))
 
 
 if __name__ == '__main__':

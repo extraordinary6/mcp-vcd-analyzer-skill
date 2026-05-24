@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.1.4`
+        Version `1.1.5`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Tighten text and JSON consistency across the legacy search path.
-- Refine parser edge cases while preserving the same feature set.
-- Keep the sanitized regression fixtures stable for quick local checks.
+        - Remove the extra cleanup helper and consolidate data token traversal.
+- Clean up internal parser flow without changing command names.
+- Retain the existing smoke tests for the legacy command surface.
 
         ## Commands
 
