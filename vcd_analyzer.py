@@ -42,7 +42,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.1.5'
+__version__ = '1.1.6'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -87,18 +87,26 @@ class _TimeParseError(ValueError):
 
 
 def parse_time(s, ts_sec):
-    """Parse time string with optional unit suffix to internal VCD timestamp."""
+    """Parse time string with optional unit suffix to internal VCD timestamp.
+
+    VCD timestamps per IEEE 1364-2005 18.2.3.8 are non-negative integers;
+    bare '-1' and '-5ns' are rejected as invalid input.
+    """
     if s is None:
         return None
     m = re.match(r'^([0-9]*\.?[0-9]+)\s*(fs|ps|ns|us|ms|s)?$', s.strip())
     if not m:
         # Fall back to bare integer ('100', '-5'); reject anything else.
         try:
-            return int(s)
+            v = int(s)
         except (ValueError, TypeError):
             raise _TimeParseError(
                 'invalid time value {!r}; expected integer ticks or value '
                 'with fs/ps/ns/us/ms/s suffix'.format(s))
+        if v < 0:
+            raise _TimeParseError(
+                'time must be non-negative; got {!r}'.format(s))
+        return v
     val, unit = float(m.group(1)), m.group(2)
     return int(val) if unit is None else int(round(val * _UNITS[unit] / ts_sec))
 
@@ -337,6 +345,8 @@ class VCDParser:
                 'path': path, 'width': width,
                 'type': bit_types.get((sc, name), 'wire'),
                 'aliases': [path],
+                'synthesized': True,    # bit-exploded reassembled bus
+                'raw_bits': len(bits),  # number of $var declarations consumed
             }
             self._bit_state[sig_id] = ['x'] * width
             # Per IEEE 1364-2005 18.2.3.7, the same identifier_code can be
@@ -346,6 +356,15 @@ class VCDParser:
             # update independently. _bit_map is therefore 1-to-many.
             for idx, sym in bits.items():
                 self._bit_map.setdefault(sym, []).append((sig_id, idx))
+
+        # Raw $var counts (transparent to IEEE 1364 spec) so 'info' can
+        # report accurate metadata even when reassembly collapses many
+        # declarations into a single synthesized bus. Distinct from
+        # `signal_count` (post-reassembly view used by agent commands).
+        self.raw_var_count = len(raw_vars)
+        self.raw_type_counts = defaultdict(int)
+        for _sym, _name, _w, _bit_str, _sc, vtype in raw_vars:
+            self.raw_type_counts[vtype] += 1
 
     def match(self, keywords):
         """Return set of sig_ids matching any keyword, or None for all.
@@ -399,21 +418,46 @@ class VCDParser:
             pending.clear()
             return items
 
-        toks = self._data_tokens()
-        for tok in toks:
-            # Top-level: section keywords vs value-change vs timestamp.
-            # Anything consumed as a "next" token after b/r/p is handled
-            # in their respective branches below, NOT here.
-            if tok in _DATA_SKIP_SECTIONS:
-                # $comment ... $end / $vcdclose ... $end: skip body
-                for t in toks:
+        # Pushback-capable token stream. Lets us peek the next token in
+        # b/r value_change branches and refuse it if it looks structural
+        # (timestamp or section keyword) — otherwise malformed inputs
+        # like 'b1010\n#10\n1!' would silently consume #10 as the
+        # identifier_code and corrupt the timeline.
+        raw = self._data_tokens()
+        pushback = []
+
+        def _next():
+            return pushback.pop() if pushback else next(raw, None)
+
+        def _looks_structural(t):
+            """True only if t is a timestamp (#<digit>...) — that's the
+            single form that cannot be a legal identifier_code in the
+            position after b/r/p. $keywords COULD be identifier_codes
+            per IEEE 1364-2005 18.2.1 (any printable ASCII), so they are
+            only treated as section headers at top-level positions."""
+            if t is None:
+                return True
+            return t.startswith('#') and len(t) > 1 and t[1].isdigit()
+
+        while True:
+            tok = _next()
+            if tok is None:
+                break
+            # Top-level: any unknown $keyword starts a section ending at
+            # $end. This is safer than passing the body through as value
+            # changes — '$bogus 1! $end' must not pollute the waveform.
+            # Known wrappers ($dumpvars etc) are pass-through (their body
+            # IS value_changes per 18.2.3.9-12).
+            if tok == '$end':
+                continue
+            if tok in _SIM_KEYWORDS:
+                continue
+            if tok.startswith('$'):
+                # $comment, $vcdclose, $bogus, ...: drop body to $end
+                for t in raw:
                     if t == '$end':
                         break
                 continue
-            if tok in _SIM_KEYWORDS or tok == '$end':
-                continue
-            if tok.startswith('$'):
-                continue  # unknown $keyword, skip
 
             if tok.startswith('#') and len(tok) > 1 and tok[1].isdigit():
                 new_t = int(tok[1:])
@@ -426,9 +470,9 @@ class VCDParser:
                 continue
 
             # Parse one value_change. May consume 1, 2, or 4 tokens.
-            # Each branch validates the body shape; malformed tokens (e.g.
-            # 'reset' starting with 'r' but not a real number) are skipped
-            # silently rather than producing fake events.
+            # Each branch validates body shape AND that the consumed sym
+            # is not actually a structural token; malformed inputs are
+            # skipped without corrupting downstream parsing state.
             first = tok[0]
             if first in '01xXzZ':
                 val = first.lower()
@@ -437,34 +481,34 @@ class VCDParser:
                     continue
             elif first in 'bB':
                 bits = tok[1:]
-                # Body must be 0/1/x/X/z/Z only (IEEE 1364 binary_number)
                 if not bits or any(c not in '01xXzZ' for c in bits):
-                    # Consume the would-be identifier to stay aligned
-                    next(toks, None)
+                    continue  # malformed body; do NOT consume next token
+                sym = _next()
+                if _looks_structural(sym):
+                    if sym is not None:
+                        pushback.append(sym)
                     continue
                 val = bits.lower()
-                sym = next(toks, None)
-                if sym is None:
-                    break
             elif first in 'rR':
                 body = tok[1:]
-                # Must look like a real number per %g format
                 if not _REAL_RE.match(body):
-                    # 'reset', 'rXYZ' etc — skip silently, consume next token
-                    next(toks, None)
+                    continue  # 'reset', 'rXYZ' etc — not a real value
+                sym = _next()
+                if _looks_structural(sym):
+                    if sym is not None:
+                        pushback.append(sym)
                     continue
                 val = body
-                sym = next(toks, None)
-                if sym is None:
-                    break
             elif first == 'p':
                 # Extended VCD (18.4.3): p<state> <s0> <s1> <id>
                 state = tok[1:] if len(tok) > 1 else ''
-                _s0 = next(toks, None)
-                _s1 = next(toks, None)
-                sym = next(toks, None)
-                if sym is None:
-                    break
+                _s0 = _next()
+                _s1 = _next()
+                sym = _next()
+                if _looks_structural(sym):
+                    if sym is not None:
+                        pushback.append(sym)
+                    continue
                 val = _PORT_STATE.get(state, 'x')
             else:
                 continue  # unparseable token
@@ -504,16 +548,27 @@ class VCDParser:
         the first #T (an initial $dumpvars block), t_min is 0. Time is
         observed-max (never less than the largest seen): malformed VCDs
         with timestamps going backwards don't produce negative duration.
-        $comment / $vcdclose bodies are skipped only when at a top-level
-        position (not when consumed as identifier_code per 18.2.1)."""
+        $comment / $vcdclose / unknown $keyword bodies are skipped only
+        when at a top-level position. Value-change body validation matches
+        iter_events so info/dump don't disagree on the same file."""
         t_min = t_max = None
         saw_initial_data = False
-        toks = self._data_tokens()
-        for tok in toks:
-            # Top-level section skips (context-sensitive: only when not
-            # being consumed as the symbol after b/r/p)
-            if tok in _DATA_SKIP_SECTIONS:
-                for t in toks:
+        raw = self._data_tokens()
+        pushback = []
+        def _next():
+            return pushback.pop() if pushback else next(raw, None)
+        def _is_struct(t):
+            if t is None: return True
+            return t.startswith('#') and len(t) > 1 and t[1].isdigit()
+
+        while True:
+            tok = _next()
+            if tok is None:
+                break
+            if tok == '$end' or tok in _SIM_KEYWORDS:
+                continue
+            if tok.startswith('$'):
+                for t in raw:
                     if t == '$end':
                         break
                 continue
@@ -525,22 +580,42 @@ class VCDParser:
                 if t_min is None:
                     t_min = 0 if saw_initial_data else t
                 t_max = t if t_max is None else max(t_max, t)
-            elif tok and tok[0] in 'bB':
-                # Multi-bit value_change: consume the identifier (which may
-                # be '$comment' etc) without treating it as a section
-                _sym = next(toks, None)
+                continue
+            # Value-change branches with body validation
+            first = tok[0] if tok else ''
+            if first in '01xXzZ' and len(tok) > 1:
                 if t_min is None:
                     saw_initial_data = True
-            elif tok and tok[0] in 'rR':
-                _sym = next(toks, None)
+            elif first in 'bB':
+                bits = tok[1:]
+                if not bits or any(c not in '01xXzZ' for c in bits):
+                    continue
+                sym = _next()
+                if _is_struct(sym):
+                    if sym is not None:
+                        pushback.append(sym)
+                    continue
                 if t_min is None:
                     saw_initial_data = True
-            elif tok and tok[0] == 'p':
-                next(toks, None); next(toks, None); next(toks, None)
+            elif first in 'rR':
+                if not _REAL_RE.match(tok[1:]):
+                    continue
+                sym = _next()
+                if _is_struct(sym):
+                    if sym is not None:
+                        pushback.append(sym)
+                    continue
                 if t_min is None:
                     saw_initial_data = True
-            elif t_min is None and tok and tok[0] in '01xXzZ':
-                saw_initial_data = True
+            elif first == 'p':
+                _next(); _next()
+                sym = _next()
+                if _is_struct(sym):
+                    if sym is not None:
+                        pushback.append(sym)
+                    continue
+                if t_min is None:
+                    saw_initial_data = True
         if t_min is None and saw_initial_data:
             t_min = t_max = 0
         return t_min, t_max
@@ -551,20 +626,20 @@ class VCDParser:
 def cmd_info(vcd, args):
     t_min, t_max = vcd.scan_time_range()
     ts = vcd.ts_sec
-    # var_type distribution: count each $var declaration (i.e., each alias)
-    type_counts = defaultdict(int)
-    ref_count = 0
-    for info in vcd.signals.values():
-        n = len(info['aliases'])
-        type_counts[info.get('type', 'wire')] += n
-        ref_count += n
+    # Counts come from the raw $var declarations (transparent to spec)
+    # rather than post-reassembly aliases. A 512-bit bit-exploded bus
+    # contributes 512 wire declarations to var_types, not 1, so agents
+    # can see actual file size. signal_count remains the post-reassembly
+    # count (what the downstream commands operate on).
+    synth = [s for s in vcd.signals.values() if s.get('synthesized')]
     r = {
         'file': vcd.path,
         'size_bytes': os.path.getsize(vcd.path),
         'timescale': vcd.ts_str.replace('$timescale', '').replace('$end', '').strip(),
-        'signal_count': len(vcd.signals),
-        'reference_count': ref_count,
-        'var_types': dict(sorted(type_counts.items(), key=lambda x: -x[1])),
+        'signal_count': len(vcd.signals),       # post-reassembly
+        'reference_count': vcd.raw_var_count,   # raw $var declarations
+        'synthesized_buses': len(synth),        # reassembled bit-bus groups
+        'var_types': dict(sorted(vcd.raw_type_counts.items(), key=lambda x: -x[1])),
         'time_min': fmt_time(t_min, ts) if t_min is not None else None,
         'time_max': fmt_time(t_max, ts) if t_max is not None else None,
         'duration': fmt_time(t_max - t_min, ts) if t_min is not None and t_max is not None else None,
@@ -580,8 +655,11 @@ def cmd_info(vcd, args):
         print('Timescale : {}'.format(r['timescale']))
         if r['signal_count'] == r['reference_count']:
             print('Signals   : {}'.format(r['signal_count']))
+        elif r['synthesized_buses']:
+            print('Signals   : {} ({} $var decls, {} reassembled as bit-buses)'.format(
+                r['signal_count'], r['reference_count'], r['synthesized_buses']))
         else:
-            print('Signals   : {} unique ({} references via aliases)'.format(
+            print('Signals   : {} unique ({} $var refs via aliases)'.format(
                 r['signal_count'], r['reference_count']))
         print('Types     : {}'.format(', '.join('{}={}'.format(k, v) for k, v in r['var_types'].items())))
         print('Time      : {} ~ {} ({})'.format(r['time_min'], r['time_max'], r['duration']))

@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.1.5`
+        Version `1.1.6`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Remove the extra cleanup helper and consolidate data token traversal.
-- Clean up internal parser flow without changing command names.
-- Retain the existing smoke tests for the legacy command surface.
+        - Add explicit structural-token checks during event parsing.
+- Reduce accidental consumption of timestamps and section markers as identifiers.
+- Keep edges and legacy search covered in the test suite.
 
         ## Commands
 
