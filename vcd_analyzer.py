@@ -43,7 +43,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.2.0'
+__version__ = '1.2.1'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -230,7 +230,7 @@ class VCDParser:
         # line(s) buffered by readline, those tokens replay first in data.
         self._initial_tokens = []
         self._bit_map = {}          # sym -> (sig_id, bit_index)
-        self._bit_state = {}        # sig_id -> [bit_val] * width
+        self._bit_state_template = {}  # sig_id -> initial bit list for replay-local reassembly
         self._parse_header()
 
     def _parse_header(self):
@@ -389,7 +389,7 @@ class VCDParser:
                 'synthesized': True,    # bit-exploded reassembled bus
                 'raw_bits': len(bits),  # number of $var declarations consumed
             }
-            self._bit_state[sig_id] = ['x'] * width
+            self._bit_state_template[sig_id] = ['x'] * width
             # Per IEEE 1364-2005 18.2.3.7, the same identifier_code can be
             # referenced under multiple paths. When two bit-exploded buses
             # share per-bit identifier codes (e.g. bus[0]/aliasbus[0] both
@@ -411,8 +411,9 @@ class VCDParser:
         """Return set of sig_ids matching any pattern, or None for all.
 
         Plain patterns use case-insensitive substring matching. Patterns
-        containing shell glob metacharacters (*, ?, [) use fnmatch-style
-        matching, also case-insensitive. Matching checks every aliased path.
+        containing shell glob metacharacters (*, ?) use fnmatch-style
+        matching, also case-insensitive. '[' is treated literally because
+        VCD bus ranges like data[7:0] are common signal names.
         """
         if not keywords:
             return None
@@ -423,7 +424,7 @@ class VCDParser:
                 pl = path.lower()
                 hit = False
                 for pat in pats:
-                    if any(ch in pat for ch in '*?['):
+                    if any(ch in pat for ch in '*?'):
                         hit = fnmatch.fnmatchcase(pl, pat)
                     else:
                         hit = pat in pl
@@ -476,6 +477,12 @@ class VCDParser:
         # identifier_code and corrupt the timeline.
         raw = self._data_tokens()
         pushback = []
+        # Replay-local bit state. iter_events() must be pure with respect
+        # to parser metadata: compare/search/summary/snapshot may replay
+        # the same VCDParser multiple times and in non-monotonic order.
+        # Object-level mutable state would leak future bit values into
+        # earlier snapshots for bit-exploded buses.
+        bit_state = {gid: bits[:] for gid, bits in self._bit_state_template.items()}
 
         def _next():
             return pushback.pop() if pushback else next(raw, None)
@@ -587,7 +594,7 @@ class VCDParser:
             if cur_t < t0:
                 if sym in self._bit_map:
                     for gid, idx in self._bit_map[sym]:
-                        self._bit_state[gid][idx] = val
+                        bit_state[gid][idx] = val
                 continue
 
             # Bit-exploded signal: aggregate into virtual bus value(s).
@@ -595,10 +602,10 @@ class VCDParser:
             # (via aliased parent declarations), each gets its own event.
             if sym in self._bit_map:
                 for gid, idx in self._bit_map[sym]:
-                    self._bit_state[gid][idx] = val
+                    bit_state[gid][idx] = val
                     if sids is not None and gid not in sids:
                         continue
-                    pending[gid] = ''.join(reversed(self._bit_state[gid]))
+                    pending[gid] = ''.join(reversed(bit_state[gid]))
                 continue
 
             # Standalone signal

@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.2.0`
+        Version `1.2.1`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Drop the dedicated edges command from the public CLI.
-- Introduce shared JSON, clipping, and summary row helpers.
-- Retain the legacy interval-based search interface for this major line.
+        - Clean up common CLI output paths after the 1.2.0 reshuffle.
+- Keep the command surface stable while improving presentation details.
+- Carry forward the same sanitized fixtures and unittest harness.
 
         ## Commands
 
