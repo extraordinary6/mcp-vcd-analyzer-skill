@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.1.2`
+        Version `1.1.3`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Polish header and event parsing without changing the CLI contract.
-- Improve robustness around mixed declaration formatting and data replay.
-- Carry the existing smoke fixtures forward unchanged.
+        - Continue stabilizing bus reconstruction and time-window analysis.
+- Reduce ambiguity in snapshot and compare style outputs.
+- Keep the repository layout and test harness consistent.
 
         ## Commands
 

@@ -42,7 +42,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.1.2'
+__version__ = '1.1.3'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -250,10 +250,17 @@ class VCDParser:
                         body.append(tok)
             self._data_offset = f.tell()
 
-        # Phase 2: detect and reassemble bit-exploded signals
+        # Phase 2: detect and reassemble bit-exploded signals.
+        # Bit-exploded heuristic per QuestaSim convention: each bit is a
+        # 1-bit $var with [N] suffix. We auto-reassemble ONLY when the bit
+        # indices form a complete 0..max_bit contiguous set. Standard-legal
+        # partial dumps (e.g. only $var ... bus[4] ... emitted) must NOT be
+        # synthesized as a bus[4:0] with phantom lower bits — they are kept
+        # as individual bit-select references.
         bit_groups = defaultdict(dict)  # (scope, base_name) -> {bit_idx: sym}
         bit_types = {}                   # (scope, base_name) -> vtype
         standalone = []
+        bit_select_singletons = []       # (sym, name, idx, sc, vtype)
 
         for sym, name, w, bit_str, sc, vtype in raw_vars:
             if w == 1 and bit_str is not None:
@@ -262,8 +269,21 @@ class VCDParser:
                     idx = int(m.group(1))
                     bit_groups[(sc, name)][idx] = sym
                     bit_types[(sc, name)] = vtype
+                    bit_select_singletons.append((sym, name, idx, sc, vtype))
                     continue
             standalone.append((sym, name, w, sc, vtype))
+
+        # Partition bit_groups: contiguous-from-0 → reassemble; else → singletons
+        non_contiguous = set()
+        for key, bits in bit_groups.items():
+            indices = set(bits.keys())
+            if indices != set(range(max(indices) + 1)):
+                non_contiguous.add(key)
+
+        # Each non-contiguous bit-select becomes a standalone 'name[idx]' signal
+        for sym, name, idx, sc, vtype in bit_select_singletons:
+            if (sc, name) in non_contiguous:
+                standalone.append((sym, '{}[{}]'.format(name, idx), 1, sc, vtype))
 
         # Register standalone signals. Per IEEE 1364-2005 18.2.3.7, the same
         # identifier_code can be referenced under multiple paths. First seen
@@ -278,7 +298,7 @@ class VCDParser:
                 }
 
         for (sc, name), bits in bit_groups.items():
-            if not bits:
+            if not bits or (sc, name) in non_contiguous:
                 continue
             max_bit = max(bits.keys())
             width = max_bit + 1
@@ -601,6 +621,17 @@ def cmd_edges(vcd, args):
     t1 = parse_time(args.end, ts) if args.end else None
     sids = vcd.match(args.filter)
     prev = {}
+    # Pre-window state replay: standalone 1-bit signals need their last
+    # value before t0 known, otherwise the first transition inside the
+    # window can't be classified as rise vs fall (the first event has no
+    # 'prev' to compare against). iter_events already maintains bit_state
+    # for bit-exploded signals during catch-up; we do the same for
+    # standalones here. Only runs when t0 > 0; cost is one extra header-to-t0
+    # scan, amortized across edge counting.
+    if t0 > 0:
+        for t, sid, val in vcd.iter_events(0, t0 - 1, sids):
+            if vcd.signals[sid]['width'] == 1:
+                prev[sid] = val
     edges = defaultdict(list)  # sid -> [(time, 'rise'|'fall')]
     for t, sid, val in vcd.iter_events(t0, t1, sids):
         if vcd.signals[sid]['width'] != 1:
@@ -828,4 +859,20 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # Make `vcd_analyzer ... | head` and similar CLI pipelines work cleanly
+    # without spewing BrokenPipeError tracebacks. On POSIX, restoring SIGPIPE
+    # to SIG_DFL causes Python to die silently as a real Unix tool would.
+    # On Windows there's no SIGPIPE; fall back to catching the exception.
+    import signal as _sig
+    if hasattr(_sig, 'SIGPIPE'):
+        _sig.signal(_sig.SIGPIPE, _sig.SIG_DFL)
+    try:
+        main()
+    except BrokenPipeError:
+        # Reroute stdout to devnull so the interpreter's final flush at exit
+        # doesn't raise a second BrokenPipeError on the already-broken pipe.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            pass
+        sys.exit(0)
