@@ -43,12 +43,13 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.2.3'
+__version__ = '1.2.4'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
 import os
 import re
+import math
 import json
 import argparse
 import fnmatch
@@ -62,7 +63,17 @@ _UNITS = {'fs': 1e-15, 'ps': 1e-12, 'ns': 1e-9, 'us': 1e-6, 'ms': 1e-3, 's': 1.0
 # real_number follows C99 printf("%g") shape: optional sign, integer and/or
 # fractional digits, optional exponent. Used to reject garbage tokens like
 # 'reset' that start with 'r' but aren't a numeric value_change.
-_REAL_RE = re.compile(r'^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$')
+#
+# Pattern written to avoid backtracking (no alternation overlap):
+#   sign?  ( digits  ( '.' digits? )?  |  '.' digits )  exponent?
+# The two top-level alternatives are disjoint (start with digit vs '.'),
+# so the engine never has to backtrack between them. Inputs are also
+# length-bounded below; real_number tokens in VCD value_changes shouldn't
+# exceed reasonable %g output width.
+_REAL_RE = re.compile(
+    r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$'
+)
+_REAL_MAX_LEN = 64  # Defensive cap: %.16g + sign + exponent fits well under this
 
 # Extended VCD port state character → 4-state mapping (IEEE 1364-2005 18.4.3.1).
 # Strengths (driver levels 0-7) are not exposed; for RTL debug the 4-state value
@@ -79,9 +90,20 @@ _PORT_STATE = {
 
 
 def _parse_timescale(text):
-    """Extract base time unit in seconds from $timescale line."""
+    """Extract base time unit in seconds from $timescale line.
+
+    IEEE 1364-2005 18.2.3.8 only allows 1, 10, or 100 as the number, but
+    we accept any positive integer for lenience. A zero or missing number
+    falls back to 1e-12 (1 ps) — the standard's default — to avoid
+    downstream division-by-zero in parse_time.
+    """
     m = re.search(r'(\d+)\s*(fs|ps|ns|us|ms|s)', text)
-    return int(m.group(1)) * _UNITS[m.group(2)] if m else 1e-12
+    if not m:
+        return 1e-12
+    n = int(m.group(1))
+    if n <= 0:
+        return 1e-12
+    return n * _UNITS[m.group(2)]
 
 
 class _TimeParseError(ValueError):
@@ -92,19 +114,31 @@ def parse_time(s, ts_sec):
     """Parse time string with optional unit suffix to internal VCD timestamp.
 
     VCD timestamps per IEEE 1364-2005 18.2.3.8 are non-negative integers.
-    - With unit: any positive value, scaled to ticks (e.g. '17.5us')
+    - With unit: any non-negative value, scaled to ticks (e.g. '17.5us', '.5ns')
     - Without unit: must be a non-negative integer tick count
 
     Bare '10.5' (no unit) is rejected to avoid silent int() truncation;
-    use '10.5ns' to specify a fractional time.
+    use '10.5ns' to specify a fractional time. Whitespace between number
+    and unit is NOT allowed ('5 ns' is rejected; standard unit literals
+    are written as a single token).
+
+    Raises _TimeParseError on any invalid input; never raises ZeroDivisionError
+    or returns unbounded values for hostile inputs.
     """
     if s is None:
         return None
-    m = re.match(r'^([0-9]*\.?[0-9]+)\s*(fs|ps|ns|us|ms|s)?$', s.strip())
+    # Length cap defends against pathological inputs causing slow regex.
+    if not isinstance(s, str) or len(s) > 64:
+        raise _TimeParseError(
+            'time value too long or wrong type; expected up to 64 chars')
+    stripped = s.strip()
+    # Reject whitespace between digits and unit. Matching is anchored on the
+    # stripped form with no \s* between value and unit.
+    m = re.match(r'^([+-]?)(\d+\.\d*|\.\d+|\d+)(fs|ps|ns|us|ms|s)?$', stripped)
     if not m:
         # Fall back to bare integer ('100', '-5'); reject anything else.
         try:
-            v = int(s)
+            v = int(stripped)
         except (ValueError, TypeError):
             raise _TimeParseError(
                 'invalid time value {!r}; expected integer ticks or value '
@@ -113,13 +147,20 @@ def parse_time(s, ts_sec):
             raise _TimeParseError(
                 'time must be non-negative; got {!r}'.format(s))
         return v
-    val_str, unit = m.group(1), m.group(2)
+    sign, val_str, unit = m.group(1), m.group(2), m.group(3)
+    if sign == '-' and val_str.strip('0.') != '':
+        # Reject negative non-zero. '-0' / '-0.0' silently treated as 0.
+        raise _TimeParseError(
+            'time must be non-negative; got {!r}'.format(s))
     if unit is None:
         if '.' in val_str:
             raise _TimeParseError(
                 'bare numeric time must be integer ticks; got {!r}. '
                 'Use a unit suffix for fractional times, e.g. {}ns'.format(s, val_str))
         return int(val_str)
+    if ts_sec <= 0:
+        raise _TimeParseError(
+            'cannot convert time with unit because VCD $timescale is 0 or invalid')
     return int(round(float(val_str) * _UNITS[unit] / ts_sec))
 
 
@@ -129,9 +170,20 @@ def fmt_time(ts, ts_sec):
     Picks the smallest unit u where |scaled| < 1000, preferring natural
     boundaries. E.g. with timescale 1ns, #5 prints as '5ns' not '5000ps';
     #17534700 prints as '17.5347us'.
+
+    Defensive: non-finite ts or ts_sec produces '?', not 'infs' / 'nans'.
     """
     if ts == 0:
         return '0s'
+    # math.isfinite handles int, float, bool. inf/nan slip through arithmetic
+    # otherwise and produce garbage like 'infs'.
+    try:
+        if not (math.isfinite(ts) and math.isfinite(ts_sec)):
+            return '?'
+    except TypeError:
+        return '?'
+    if ts_sec <= 0:
+        return '?'
     sec = ts * ts_sec
     for u in ('fs', 'ps', 'ns', 'us', 'ms', 's'):
         scaled = sec / _UNITS[u]
@@ -572,7 +624,10 @@ class VCDParser:
                 val = bits.lower()
             elif first in 'rR':
                 body = tok[1:]
-                if not _REAL_RE.match(body):
+                # Length cap defends against malicious VCDs that try to
+                # exploit regex worst-case behavior with multi-KB tokens.
+                # Legitimate %.16g output is ~25 chars max.
+                if len(body) > _REAL_MAX_LEN or not _REAL_RE.match(body):
                     continue  # 'reset', 'rXYZ' etc — not a real value
                 sym = _next()
                 if _looks_structural(sym):
@@ -694,7 +749,8 @@ class VCDParser:
                 if t_min is None:
                     saw_initial_data = True
             elif first in 'rR':
-                if not _REAL_RE.match(tok[1:]):
+                body = tok[1:]
+                if len(body) > _REAL_MAX_LEN or not _REAL_RE.match(body):
                     continue
                 sym = _next()
                 if _is_struct(sym):

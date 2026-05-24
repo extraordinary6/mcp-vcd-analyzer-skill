@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.2.3`
+        Version `1.2.4`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Tune result payload details while keeping the 1.2 command surface stable.
-- Continue cleaning up JSON structures around interval-based search.
-- Retain the same unittest coverage points for backwards compatibility.
+        - Keep the earlier 1.2.4 snapshot because it stays closest to both 1.2.3 and 1.2.5.
+- Tighten time parsing, overflow handling, and general CLI validation.
+- Preserve the legacy search interface and sanitized regression assets.
 
         ## Commands
 
