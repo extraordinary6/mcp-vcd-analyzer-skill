@@ -10,7 +10,8 @@ Commands:
   summary    <file> [--begin T] [--end T] [--filter K1,K2]   Per-signal stats: change count, unique values, static detection
   snapshot   <file> --at T [--filter K1,K2]        Known signal values at a given time point
   compare    <file> --at T1,T2 [--filter K1,K2]    Diff signal values between two time points
-  search     <file> --value V [--signal K] [--begin T] [--end T] [--filter K1,K2]   Find intervals where signal state equals a value
+  search     <file> --condition C [--show K1,K2] [--changed K] [--begin T] [--end T]
+                                                        Conditional search and associated signal observation
 
 Global options:
   --json       Output compact structured JSON instead of text (time fields include *_ticks)
@@ -25,11 +26,11 @@ Argument formats:
   --begin T       Start time with optional unit suffix: 0, 100ns, 17.5us, 1ms, 500ps, 200fs
   --end T         End time, same format as --begin. Omit for no upper bound
   --at T          Time point for snapshot. For compare: two points comma-separated: --at 17.5us,17.7us
-  --value V       Target value for search: decimal (42), hex (0x2a),
-                  or binary with explicit prefix (0b101010 or b101010).
-                  Leading-zero forms like "0010" parse as decimal 10;
-                  use "0b0010" to mean binary 2.
-  --signal K      Additional keyword filter for search, targets signal name specifically
+  --condition C   Comma-separated AND conditions: SIG=VAL, SIG==VAL, SIG!=VAL.
+                  Condition signal patterns must match exactly one signal.
+                  Values use the same numeric/4-state matching as previous search values.
+  --show K1,K2    Optional associated signals to display while condition holds.
+  --changed K     Optional trigger signal; emit events only when this signal changes.
 
 Examples:
   vcd_analyzer info sim.vcd
@@ -38,12 +39,13 @@ Examples:
   vcd_analyzer summary sim.vcd --filter dll_st,locked
   vcd_analyzer snapshot sim.vcd --at 17.55us --filter init_done,state
   vcd_analyzer compare sim.vcd --at 17.535us,17.56us --filter init_done,link_active,state
-  vcd_analyzer search sim.vcd --signal state --value 5
-  vcd_analyzer search sim.vcd --value 0xff --begin 100ns --end 500ns
+  vcd_analyzer search sim.vcd --condition "state=5"
+  vcd_analyzer search sim.vcd --condition "arvalid=1,arready=1" --show araddr,arlen,arid
+  vcd_analyzer search sim.vcd --changed data_out --condition "valid=0" --show data_out,valid
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.2.12'
+__version__ = '1.3.0'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -171,7 +173,11 @@ class _FilterParseError(argparse.ArgumentTypeError):
 
 
 class _ValueParseError(ValueError):
-    """Raised when --value is too large or malformed beyond tolerant matching."""
+    """Raised when a target value is too large or malformed beyond tolerant matching."""
+
+
+class _ConditionParseError(ValueError):
+    """Raised when search --condition / --show / --changed is invalid."""
 
 
 class _VCDResourceError(RuntimeError):
@@ -1243,6 +1249,178 @@ def _value_matches(value, target_raw, target_int):
     return value == target_raw
 
 
+_COND_RE = re.compile(r'^\s*(.+?)\s*(==|=|!=)\s*(.+?)\s*$')
+
+
+def _has_unknown(value):
+    """True when a VCD value is unknown/ambiguous for negative predicates."""
+    return value is None or 'x' in value or 'z' in value
+
+
+def _condition_match(value, op, target_raw, target_int):
+    """Evaluate one resolved condition against a raw VCD value.
+
+    Equality reuses the existing two-mode value matcher, so numeric targets
+    are compared numerically and mixed x/z literals are compared literally.
+
+    Inequality is deliberately stricter than `not _value_matches(...)`:
+    x/z/undef do NOT satisfy `!=`. In RTL debug, unknown is not evidence that
+    a signal is definitely different from a value. Users who want unknowns
+    should ask for them explicitly, e.g. `valid=x`.
+    """
+    if value is None:
+        return False
+    if op in ('=', '=='):
+        return _value_matches(value, target_raw, target_int)
+    if op == '!=':
+        if _has_unknown(value):
+            return False
+        return not _value_matches(value, target_raw, target_int)
+    raise AssertionError('unsupported condition operator {}'.format(op))
+
+
+def _parse_conditions(text):
+    """Parse comma-separated AND conditions into unresolved condition dicts."""
+    if text is None or not str(text).strip():
+        raise _ConditionParseError('search requires --condition')
+    conditions = []
+    for item in str(text).split(','):
+        item = item.strip()
+        if not item:
+            continue
+        m = _COND_RE.match(item)
+        if not m:
+            raise _ConditionParseError(
+                'invalid condition {!r}; expected SIG=VAL, SIG==VAL, or SIG!=VAL'.format(item))
+        sig_pat = m.group(1).strip()
+        op = m.group(2)
+        val_text = m.group(3).strip()
+        if not sig_pat or not val_text:
+            raise _ConditionParseError(
+                'invalid empty signal/value in condition {!r}'.format(item))
+        target_raw, target_int = _parse_target_value(val_text)
+        conditions.append({
+            'pattern': sig_pat,
+            'op': op,
+            'target_raw': target_raw,
+            'target_int': target_int,
+            'original': item,
+            'value_text': val_text,
+        })
+    if not conditions:
+        raise _ConditionParseError('search requires at least one condition')
+    return conditions
+
+
+def _resolve_one_signal(vcd, pattern, role):
+    """Resolve a condition/trigger pattern to exactly one signal id.
+
+    Matching normally follows VCDParser.match(): substring unless '*' or '?'
+    is present. For condition/trigger positions, however, an exact full path
+    should win over substring matches. Otherwise a precise path like
+    'tb.u.rd_valid' would be rejected merely because 'tb.u.rd_valid0' exists.
+    """
+    pat = str(pattern).strip()
+    pl = pat.lower()
+    exact = set()
+    if '*' not in pat and '?' not in pat:
+        for sid, info in vcd.signals.items():
+            for path in info['aliases']:
+                if path.lower() == pl:
+                    exact.add(sid)
+        if len(exact) == 1:
+            return next(iter(exact))
+        if len(exact) > 1:
+            examples = [vcd.signals[s]['path']
+                        for s in sorted(exact, key=lambda sid: vcd.signals[sid]['path'])[:5]]
+            raise _ConditionParseError(
+                '{} pattern {!r} exactly matches {} signals; use list to choose a more specific name, examples: {}'.format(
+                    role, pattern, len(exact), ', '.join(examples)))
+
+    sids = vcd.match([pattern])
+    if not sids:
+        raise _ConditionParseError('{} pattern {!r} matches no signals'.format(role, pattern))
+    if len(sids) != 1:
+        examples = [vcd.signals[s]['path']
+                    for s in sorted(sids, key=lambda sid: vcd.signals[sid]['path'])[:5]]
+        extra = ', examples: {}'.format(', '.join(examples)) if examples else ''
+        raise _ConditionParseError(
+            '{} pattern {!r} matches {} signals; use list to choose a more specific name{}'.format(
+                role, pattern, len(sids), extra))
+    return next(iter(sids))
+
+
+def _resolve_conditions(vcd, text):
+    """Parse and resolve condition signal patterns to signal ids."""
+    resolved = []
+    seen = set()
+    for c in _parse_conditions(text):
+        sid = _resolve_one_signal(vcd, c['pattern'], 'condition signal')
+        key = (sid, c['op'], c['target_raw'], c['target_int'])
+        if key in seen:
+            continue
+        seen.add(key)
+        c = dict(c)
+        c['sid'] = sid
+        c['path'] = vcd.signals[sid]['path']
+        resolved.append(c)
+    return resolved
+
+
+def _resolve_show_sids(vcd, show_patterns):
+    """Resolve --show patterns. Unlike conditions, show may match many signals."""
+    if not show_patterns:
+        return []
+    pats = _normalize_filter_patterns(show_patterns)
+    if not pats:
+        return []
+    sids = vcd.match(pats)
+    if not sids:
+        raise _ConditionParseError('--show matches no signals')
+    return sorted(sids, key=lambda sid: vcd.signals[sid]['path'])
+
+
+def _conditions_hold(state, conditions):
+    for c in conditions:
+        if not _condition_match(state.get(c['sid']), c['op'], c['target_raw'], c['target_int']):
+            return False
+    return True
+
+
+def _condition_label(conditions):
+    return ','.join(c['original'] for c in conditions)
+
+
+def _condition_result_text(conditions):
+    return ','.join('{}{}{}'.format(c['path'], c['op'], c['value_text']) for c in conditions)
+
+
+def _show_values(vcd, state, show_sids, verbose=False):
+    """Return display values for show signals in current state."""
+    values = {}
+    if verbose:
+        meta = {}
+    for sid in show_sids:
+        info = vcd.signals[sid]
+        path = info['path']
+        raw = state.get(sid)
+        values[path] = fmt_val(raw, info) if raw is not None else '(undef)'
+        if verbose:
+            meta[path] = {'raw': raw, 'width': info['width'], 'type': info.get('type', 'wire')}
+    return (values, meta) if verbose else values
+
+
+def _values_text(values):
+    return ' '.join('{}={}'.format(k, v) for k, v in values.items())
+
+
+def _search_end_time(vcd, t0, t1):
+    if t1 is not None:
+        return t1
+    _mn, mx = vcd.scan_time_range()
+    return mx if mx is not None else t0
+
+
 def _event_groups(vcd, t0, t1, sids):
     """Yield (time, [(sid, val), ...]) groups in time order."""
     cur_t = None
@@ -1670,69 +1848,183 @@ def cmd_compare(vcd, args):
 def cmd_search(vcd, args):
     ts = vcd.ts_sec
     t0 = parse_time(args.begin, ts) if args.begin else 0
-    if args.end:
-        t1 = parse_time(args.end, ts)
-    else:
-        _mn, mx = vcd.scan_time_range()
-        t1 = mx if mx is not None else t0
+    t1_raw = parse_time(args.end, ts) if args.end else None
+    t1 = _search_end_time(vcd, t0, t1_raw)
     if t1 < t0:
         raise _TimeParseError('end time must be >= begin time')
-    flt = [args.signal] if args.signal else args.filter
-    selected = _selected_sids(vcd, vcd.match(flt))
-    if not selected:
-        msg = 'No signals match the given filter'
-        if args.json:
-            _json({'begin': fmt_time(t0, ts), 'begin_ticks': t0, 'begin_h': fmt_time(t0, ts),
-                   'end': fmt_time(t1, ts), 'end_ticks': t1, 'end_h': fmt_time(t1, ts),
-                   'total': 0, 'shown': 0, 'truncated': False, 'matches': [], 'message': msg})
-        else:
-            print(msg)
-        return
-    target_raw, target_int = _parse_target_value(args.value)
-    matches = []
-    known = set()
-    for sid, a, b, val, since in _signal_value_intervals(vcd, t0, t1, selected):
-        known.add(sid)
-        if _value_matches(val, target_raw, target_int):
-            info = vcd.signals[sid]
-            m = {'begin': fmt_time(a, ts), 'begin_ticks': a, 'begin_h': fmt_time(a, ts),
-                 'end': fmt_time(b, ts), 'end_ticks': b, 'end_h': fmt_time(b, ts),
-                 'path': info['path'], 'value': fmt_val(val, info)}
-            if getattr(args, 'verbose', False):
-                m['width'] = info['width']
-                m['type'] = info.get('type', 'wire')
-                m['since'] = fmt_time(since, ts) if since is not None else None
-                m['since_ticks'] = since
-                m['since_h'] = fmt_time(since, ts) if since is not None else None
-            matches.append(m)
-    limit = _limit(args, 'search')
-    shown, trunc = _clip(matches, limit)
-    if args.json:
-        _json({'begin': fmt_time(t0, ts), 'begin_ticks': t0, 'begin_h': fmt_time(t0, ts),
-               'end': fmt_time(t1, ts), 'end_ticks': t1, 'end_h': fmt_time(t1, ts),
-               'searched_signals': len(selected), 'defined_signals': len(known),
-               'target': args.value, 'total': len(matches), 'shown': len(shown),
-               'truncated': trunc, 'matches': shown})
-        return
-    if matches:
-        print('Found: {} interval(s)'.format(len(matches)))
-        for m in shown:
-            if getattr(args, 'verbose', False):
-                since = '' if m.get('since') is None else ' since={}'.format(m.get('since'))
-                print('  {:<12}..{:<12} {:<50} = {}{}'.format(
-                    m['begin'], m['end'], m['path'], m['value'], since))
-            else:
-                print('  {:<12}..{:<12} {:<50} = {}'.format(
-                    m['begin'], m['end'], m['path'], m['value']))
-        if trunc:
-            print(_trunc_line(len(shown), len(matches), 'intervals'))
-    else:
-        if not known:
-            print('No defined value in {}..{} for selected signals.'.format(fmt_time(t0, ts), fmt_time(t1, ts)))
-        else:
-            print('No interval in {}..{} where selected signals equal "{}".'.format(
-                fmt_time(t0, ts), fmt_time(t1, ts), args.value))
 
+    conditions = _resolve_conditions(vcd, args.condition)
+    show_sids = _resolve_show_sids(vcd, args.show)
+    changed_sid = _resolve_one_signal(vcd, args.changed, 'changed signal') if args.changed else None
+    if changed_sid is not None and not show_sids:
+        show_sids = [changed_sid]
+
+    selected = set(c['sid'] for c in conditions)
+    selected.update(show_sids)
+    if changed_sid is not None:
+        selected.add(changed_sid)
+
+    state = _build_snapshot(vcd, t0, selected)
+    limit = _limit(args, 'search')
+    verbose = getattr(args, 'verbose', False)
+    cond_label = _condition_label(conditions)
+    cond_text = _condition_result_text(conditions)
+
+    if changed_sid is not None:
+        events = []
+        total = 0
+        for t, group in _event_groups(vcd, t0, t1, selected):
+            changed = set()
+            for sid, val in group:
+                state[sid] = val
+                changed.add(sid)
+            if changed_sid not in changed:
+                continue
+            if not _conditions_hold(state, conditions):
+                continue
+            values = _show_values(vcd, state, show_sids, verbose)
+            if verbose:
+                values, meta = values
+            event = {'time_ticks': t, 'time_h': fmt_time(t, ts), 'values': values}
+            if verbose:
+                event['meta'] = meta
+            total += 1
+            if limit == 0 or len(events) < limit:
+                events.append(event)
+        trunc = limit != 0 and total > len(events)
+        if args.json:
+            obj = {'mode': 'event', 'condition': cond_label,
+                   'condition_resolved': cond_text,
+                   'changed': vcd.signals[changed_sid]['path'],
+                   'show': [vcd.signals[sid]['path'] for sid in show_sids],
+                   'begin_ticks': t0, 'begin_h': fmt_time(t0, ts),
+                   'end_ticks': t1, 'end_h': fmt_time(t1, ts),
+                   'total': total, 'shown': len(events), 'truncated': trunc,
+                   'events': events}
+            _json(obj)
+            return
+        if events:
+            print('Found: {} event(s)'.format(total))
+            for e in events:
+                print('  T={:<12} {}'.format(e['time_h'], _values_text(e['values'])))
+            if trunc:
+                print(_trunc_line(len(events), total, 'events'))
+        else:
+            print('No event in {}..{} where {} and {} changes.'.format(
+                fmt_time(t0, ts), fmt_time(t1, ts), cond_text, vcd.signals[changed_sid]['path']))
+        return
+
+    # Interval/segment mode. A segment is an interval further split whenever
+    # the displayed show-value tuple changes while the condition remains true.
+    has_show = bool(show_sids)
+    active = _conditions_hold(state, conditions)
+    seg_start = t0 if active else None
+    seg_values = _show_values(vcd, state, show_sids, verbose) if (active and has_show) else None
+    if active and has_show and verbose:
+        seg_values, seg_meta = seg_values
+    else:
+        seg_meta = None
+
+    results = []
+    total = 0
+
+    def emit_interval(a, b):
+        return {'begin_ticks': a, 'begin_h': fmt_time(a, ts),
+                'end_ticks': b, 'end_h': fmt_time(b, ts)}
+
+    def append_result(row):
+        nonlocal total
+        total += 1
+        if limit == 0 or len(results) < limit:
+            results.append(row)
+
+    for t, group in _event_groups(vcd, t0, t1, selected):
+        changed = set()
+        for sid, val in group:
+            state[sid] = val
+            changed.add(sid)
+
+        cond_ok = _conditions_hold(state, conditions)
+        if not has_show:
+            if cond_ok and not active:
+                active = True
+                seg_start = t
+            elif not cond_ok and active:
+                append_result(emit_interval(seg_start, t))
+                active = False
+                seg_start = None
+            continue
+
+        if not cond_ok:
+            if active:
+                row = emit_interval(seg_start, t)
+                row['values'] = seg_values
+                if verbose:
+                    row['meta'] = seg_meta
+                append_result(row)
+                active = False
+                seg_start = None
+                seg_values = None
+                seg_meta = None
+            continue
+
+        new_values = _show_values(vcd, state, show_sids, verbose)
+        if verbose:
+            new_values, new_meta = new_values
+        else:
+            new_meta = None
+
+        if not active:
+            active = True
+            seg_start = t
+            seg_values = new_values
+            seg_meta = new_meta
+        elif new_values != seg_values:
+            row = emit_interval(seg_start, t)
+            row['values'] = seg_values
+            if verbose:
+                row['meta'] = seg_meta
+            append_result(row)
+            seg_start = t
+            seg_values = new_values
+            seg_meta = new_meta
+
+    if active:
+        row = emit_interval(seg_start, t1)
+        if has_show:
+            row['values'] = seg_values
+            if verbose:
+                row['meta'] = seg_meta
+        append_result(row)
+
+    trunc = limit != 0 and total > len(results)
+    if args.json:
+        key = 'segments' if has_show else 'intervals'
+        obj = {'mode': 'segment' if has_show else 'interval',
+               'condition': cond_label,
+               'condition_resolved': cond_text,
+               'show': [vcd.signals[sid]['path'] for sid in show_sids],
+               'begin_ticks': t0, 'begin_h': fmt_time(t0, ts),
+               'end_ticks': t1, 'end_h': fmt_time(t1, ts),
+               'total': total, 'shown': len(results), 'truncated': trunc,
+               key: results}
+        _json(obj)
+        return
+
+    noun = 'segment' if has_show else 'interval'
+    if results:
+        print('Found: {} {}(s)'.format(total, noun))
+        for r in results:
+            if has_show:
+                print('  {:<12}..{:<12} {}'.format(
+                    r['begin_h'], r['end_h'], _values_text(r['values'])))
+            else:
+                print('  {:<12}..{:<12} {}'.format(r['begin_h'], r['end_h'], cond_text))
+        if trunc:
+            print(_trunc_line(len(results), total, noun + 's'))
+    else:
+        print('No {} in {}..{} where {}.'.format(
+            noun, fmt_time(t0, ts), fmt_time(t1, ts), cond_text))
 
 # -- CLI entry ---------------------------------------------------------------
 
@@ -1796,11 +2088,14 @@ def main():
     sp.add_argument('--at', metavar='T1,T2', required=True, help='two time points comma-separated, e.g. 17.5us,17.7us')
     _add_filter(sp); _add_common(sp)
 
-    sp = sub.add_parser('search', help='find stable intervals where signal state equals a value')
-    sp.add_argument('file', metavar='<file>'); _add_time_args(sp); _add_filter(sp); _add_common(sp)
-    sp.add_argument('--signal', metavar='PATTERN', help='pattern to narrow which signals to search')
-    sp.add_argument('--value', metavar='VAL', required=True,
-                    help='target value: decimal (42), hex (0x2a), or binary (0b101010 or b101010)')
+    sp = sub.add_parser('search', help='conditional search and associated signal observation')
+    sp.add_argument('file', metavar='<file>'); _add_time_args(sp); _add_common(sp)
+    sp.add_argument('--condition', metavar='COND', required=True,
+                    help='comma-separated AND conditions, e.g. "valid=1,ready=1"')
+    sp.add_argument('--show', metavar='PAT1,PAT2,...', type=_normalize_filter_patterns,
+                    help='signals to display while the condition holds')
+    sp.add_argument('--changed', metavar='PATTERN',
+                    help='emit events only when this signal changes; must match exactly one signal')
 
     args = p.parse_args()
     if not args.cmd:
@@ -1821,6 +2116,8 @@ def main():
     except _TimeParseError as e:
         sys.exit('Error: ' + str(e))
     except _ValueParseError as e:
+        sys.exit('Error: ' + str(e))
+    except _ConditionParseError as e:
         sys.exit('Error: ' + str(e))
     except _VCDResourceError as e:
         sys.exit('Error: ' + str(e))

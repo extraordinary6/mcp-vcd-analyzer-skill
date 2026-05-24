@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.2.12`
+        Version `1.3.0`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Add date, version, and comment metadata capture from VCD headers.
-- Strengthen resource caps around parser state and metadata retention.
-- Keep the legacy interval-based search interface as the last 1.2 branch.
+        - Replace legacy value search with condition-based search, show-signals, and changed-signal modes.
+- Keep the rest of the waveform inspection CLI familiar while modernizing search semantics.
+- Introduce a dedicated sanitized search fixture for the new interface.
 
         ## Commands
 
@@ -38,7 +38,8 @@ Commands:
   summary    <file> [--begin T] [--end T] [--filter K1,K2]   Per-signal stats: change count, unique values, static detection
   snapshot   <file> --at T [--filter K1,K2]        Known signal values at a given time point
   compare    <file> --at T1,T2 [--filter K1,K2]    Diff signal values between two time points
-  search     <file> --value V [--signal K] [--begin T] [--end T] [--filter K1,K2]   Find intervals where signal state equals a value
+  search     <file> --condition C [--show K1,K2] [--changed K] [--begin T] [--end T]
+                                                        Conditional search and associated signal observation
 
 Global options:
   --json       Output compact structured JSON instead of text (time fields include *_ticks)
@@ -53,11 +54,11 @@ Argument formats:
   --begin T       Start time with optional unit suffix: 0, 100ns, 17.5us, 1ms, 500ps, 200fs
   --end T         End time, same format as --begin. Omit for no upper bound
   --at T          Time point for snapshot. For compare: two points comma-separated: --at 17.5us,17.7us
-  --value V       Target value for search: decimal (42), hex (0x2a),
-                  or binary with explicit prefix (0b101010 or b101010).
-                  Leading-zero forms like "0010" parse as decimal 10;
-                  use "0b0010" to mean binary 2.
-  --signal K      Additional keyword filter for search, targets signal name specifically
+  --condition C   Comma-separated AND conditions: SIG=VAL, SIG==VAL, SIG!=VAL.
+                  Condition signal patterns must match exactly one signal.
+                  Values use the same numeric/4-state matching as previous search values.
+  --show K1,K2    Optional associated signals to display while condition holds.
+  --changed K     Optional trigger signal; emit events only when this signal changes.
 
 Examples:
   vcd_analyzer info sim.vcd
@@ -66,8 +67,9 @@ Examples:
   vcd_analyzer summary sim.vcd --filter dll_st,locked
   vcd_analyzer snapshot sim.vcd --at 17.55us --filter init_done,state
   vcd_analyzer compare sim.vcd --at 17.535us,17.56us --filter init_done,link_active,state
-  vcd_analyzer search sim.vcd --signal state --value 5
-  vcd_analyzer search sim.vcd --value 0xff --begin 100ns --end 500ns
+  vcd_analyzer search sim.vcd --condition "state=5"
+  vcd_analyzer search sim.vcd --condition "arvalid=1,arready=1" --show araddr,arlen,arid
+  vcd_analyzer search sim.vcd --changed data_out --condition "valid=0" --show data_out,valid
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
         ```
 
