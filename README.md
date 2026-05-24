@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.1.3`
+        Version `1.1.4`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Continue stabilizing bus reconstruction and time-window analysis.
-- Reduce ambiguity in snapshot and compare style outputs.
-- Keep the repository layout and test harness consistent.
+        - Tighten text and JSON consistency across the legacy search path.
+- Refine parser edge cases while preserving the same feature set.
+- Keep the sanitized regression fixtures stable for quick local checks.
 
         ## Commands
 

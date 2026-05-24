@@ -42,7 +42,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.1.3'
+__version__ = '1.1.4'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -111,16 +111,19 @@ def fmt_val(value, info):
 
     info: dict with 'width' (required) and 'type' (optional, default 'wire').
 
-    Width==1 covers both 1-bit scalars (0/1/x/z) and real numbers (rendered
-    as decimal string by the simulator using %.16g). Multi-bit values are
-    left-extended per Table 18-1: MSB X/Z extends with X/Z, else 0.
-    Events (var_type 'event' per 18.2.3.7) display as 'triggered' since the
-    dumped value is just a marker (18.2.2).
+    Real/realtime values (18.2.2) carry the simulator's %.16g rendering as
+    their literal value string and have no bit width — declared width (often
+    64) is purely cosmetic and must not trigger vector left-extension.
+    Multi-bit vectors are left-extended per Table 18-1: MSB X/Z extends
+    with X/Z, else 0. Events (var_type 'event' per 18.2.3.7) display as
+    'triggered' since the dumped value is just a marker.
     """
-    width = info['width']
     vtype = info.get('type', 'wire')
     if vtype == 'event':
         return 'triggered'
+    if vtype in ('real', 'realtime'):
+        return value
+    width = info['width']
     if width == 1:
         return value
     # Left-extend short vectors. Writer drops redundant MSB bits when they
@@ -310,8 +313,13 @@ class VCDParser:
                 'aliases': [path],
             }
             self._bit_state[sig_id] = ['x'] * width
+            # Per IEEE 1364-2005 18.2.3.7, the same identifier_code can be
+            # referenced under multiple paths. When two bit-exploded buses
+            # share per-bit identifier codes (e.g. bus[0]/aliasbus[0] both
+            # use '!'), each is a separate synthesized signal that must
+            # update independently. _bit_map is therefore 1-to-many.
             for idx, sym in bits.items():
-                self._bit_map[sym] = (sig_id, idx)
+                self._bit_map.setdefault(sym, []).append((sig_id, idx))
 
     def match(self, keywords):
         """Return set of sig_ids matching any keyword, or None for all.
@@ -425,17 +433,19 @@ class VCDParser:
             # Catch-up before t0: update bit_state only, don't emit
             if cur_t < t0:
                 if sym in self._bit_map:
-                    gid, idx = self._bit_map[sym]
-                    self._bit_state[gid][idx] = val
+                    for gid, idx in self._bit_map[sym]:
+                        self._bit_state[gid][idx] = val
                 continue
 
-            # Bit-exploded signal: aggregate into virtual bus value
+            # Bit-exploded signal: aggregate into virtual bus value(s).
+            # If the same identifier_code drives multiple synthesized buses
+            # (via aliased parent declarations), each gets its own event.
             if sym in self._bit_map:
-                gid, idx = self._bit_map[sym]
-                self._bit_state[gid][idx] = val
-                if sids is not None and gid not in sids:
-                    continue
-                pending[gid] = ''.join(reversed(self._bit_state[gid]))
+                for gid, idx in self._bit_map[sym]:
+                    self._bit_state[gid][idx] = val
+                    if sids is not None and gid not in sids:
+                        continue
+                    pending[gid] = ''.join(reversed(self._bit_state[gid]))
                 continue
 
             # Standalone signal
