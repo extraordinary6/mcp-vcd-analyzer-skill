@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.2.9`
+        Version `1.2.10`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Introduce bounded integer parsing for widths and bit indices.
-- Harden header parsing against split or oversized numeric fields.
-- Retain the same regression-friendly fixture layout.
+        - Improve defensive parsing and error surfacing across the 1.2 line.
+- Keep the public command set and legacy search interface stable.
+- Carry the same sanitized test suite forward.
 
         ## Commands
 

@@ -43,7 +43,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.2.9'
+__version__ = '1.2.10'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -76,7 +76,7 @@ def _env_int(name, default):
     return value if value > 0 else default
 
 
-MAX_VARS = _env_int('VCD_ANALYZER_MAX_VARS', 500_000)
+MAX_VARS = _env_int('VCD_ANALYZER_MAX_VARS', 1_000_000)
 MAX_REASSEMBLE_BITS = _env_int('VCD_ANALYZER_MAX_REASSEMBLE_BITS', 65536)
 MAX_TIME_ARG_LEN = 100         # CLI/programmatic time string length cap
 MAX_TIME_TICKS = (1 << 63) - 1  # int64 max — keeps downstream arithmetic safe
@@ -85,12 +85,24 @@ MAX_FILTER_WILDCARDS = 16
 
 # Additional header-section caps. Defaults are far above any legitimate
 # engineering VCD but cleanly refuse pathological/malicious construction.
+#
+# Two failure modes are used:
+#  - fail-fast (raise _VCDResourceError): for caps whose violation would
+#    corrupt data correctness (lost value_changes, lost $var declarations,
+#    deep scope that breaks path reconstruction).
+#  - silent drop (truncate retained list): for metadata-only caps whose
+#    violation only affects the cosmetic output of `info --verbose`. These
+#    are noted inline where they apply.
 MAX_INT_DIGITS = 100              # any int-from-string in header (width, bit idx, msb/lsb)
 MAX_SIGNAL_WIDTH = MAX_REASSEMBLE_BITS  # max bits per single $var declaration
-MAX_HEADER_BODY_TOKENS = 131072   # any $<kw>...$end section body length
-MAX_COMMENTS = 1024               # number of $comment sections retained
-MAX_SCOPE_DEPTH = 64              # $scope nesting depth
+MAX_HEADER_BODY_TOKENS = 131072   # any $<kw>...$end section body length (metadata-only effect:
+                                  # truncates $comment / $date / $version bodies; $var bodies
+                                  # are never long enough to be affected in practice)
+MAX_COMMENTS = 1024               # number of $comment sections retained (metadata-only)
+MAX_SCOPE_DEPTH = 256             # $scope nesting depth (fail-fast: lost scope breaks path)
 MAX_INITIAL_TOKENS = 131072       # tokens buffered from same line as $enddefinitions $end
+                                  # (fail-fast: these are data tokens, dropping them
+                                  # would silently corrupt waveforms)
 
 
 # IEEE 1364-2005 18.2.2 real value_change is 'r' + real_number where
@@ -471,11 +483,19 @@ class VCDParser:
                 for tok in line.split():
                     if done:
                         # Buffer tokens that share the same line as
-                        # `$enddefinitions $end`. Cap defends against
-                        # a malicious VCD packing the entire data stream
-                        # on the same line as the header terminator.
-                        if len(self._initial_tokens) < MAX_INITIAL_TOKENS:
-                            self._initial_tokens.append(tok)
+                        # `$enddefinitions $end`. These are data tokens
+                        # (value_changes, timestamps), so they MUST NOT
+                        # be silently dropped — that would corrupt the
+                        # waveform without the user noticing. Fail-fast.
+                        # Normal VCDs have at most a handful of tokens
+                        # on this line; 131072 is comfortably above any
+                        # legitimate use.
+                        if len(self._initial_tokens) >= MAX_INITIAL_TOKENS:
+                            raise _VCDResourceError(
+                                'too many data tokens on the same line as '
+                                '$enddefinitions $end (>{}); file may be '
+                                'corrupt or malicious'.format(MAX_INITIAL_TOKENS))
+                        self._initial_tokens.append(tok)
                         continue
                     if current_kw is None:
                         if tok in _DECL_KEYWORDS:
@@ -583,17 +603,24 @@ class VCDParser:
                             self.version = ' '.join(body)
                         elif current_kw == '$comment':
                             # Per 18.2.3.1, $comment may appear multiple
-                            # times in header; collect all up to a cap to
-                            # defend against 1M-comment construction.
+                            # times. Silent drop after the cap is safe:
+                            # comments are metadata, not data — losing
+                            # the 1025th comment only affects what
+                            # `info --verbose` prints, never the waveform.
                             if len(self.comments) < MAX_COMMENTS:
                                 self.comments.append(' '.join(body))
                         current_kw = None
                     else:
-                        # Bound section body. Defends against a malicious
-                        # VCD packing megabytes of tokens inside a $comment
-                        # (or any other section) before $end. Tokens beyond
-                        # the cap are silently dropped; the $end terminator
-                        # still closes the section correctly.
+                        # Bound section body. In practice this only
+                        # truncates oversized $comment / $date / $version
+                        # bodies — metadata. $var bodies are 4-8 tokens,
+                        # $scope is 2, $timescale is 2; none come close
+                        # to the cap. Silent drop is safe because:
+                        #   - the $end token still closes the section
+                        #     correctly (we still see it in the outer
+                        #     loop, we just stop appending to body)
+                        #   - dropped tokens never become part of any
+                        #     value_change interpretation
                         if len(body) < MAX_HEADER_BODY_TOKENS:
                             body.append(tok)
             self._data_offset = f.tell()
