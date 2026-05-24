@@ -43,7 +43,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.2.6'
+__version__ = '1.2.7'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -792,7 +792,10 @@ class VCDParser:
             else:
                 continue  # unparseable token
 
-            # Catch-up before t0: update bit_state only, don't emit
+            # Catch-up before t0: update bit_state only, don't emit.
+            # Standalone state is owned by callers (e.g. _build_snapshot
+            # accumulates it from yielded events), so nothing to do here
+            # for the standalone case — the continue is correct.
             if cur_t < t0:
                 if sym in bit_map:
                     for gid, idx in bit_map[sym]:
@@ -802,13 +805,22 @@ class VCDParser:
             # Bit-exploded signal: aggregate into virtual bus value(s).
             # If the same identifier_code drives multiple synthesized buses
             # (via aliased parent declarations), each gets its own event.
+            #
+            # IMPORTANT: do NOT continue after this branch. Per IEEE 1364-2005
+            # 18.2.3.7, the same identifier_code can be referenced by both a
+            # standalone $var (e.g. clk) AND a bit-select $var (e.g.
+            # data_bus[0]) when RTL assigns one to the other. If we continued,
+            # the standalone alias would silently never emit events and the
+            # agent would see clk as a flat line. Fall through to the
+            # standalone block so both signals update on the same value_change.
             if sym in bit_map:
                 for gid, idx in bit_map[sym]:
                     bit_state[gid][idx] = val
-                    pending[gid] = ''.join(reversed(bit_state[gid]))
-                continue
+                    if sids is None or gid in sids:
+                        pending[gid] = ''.join(reversed(bit_state[gid]))
 
-            # Standalone signal
+            # Standalone signal (may run after the bit-bus branch above when
+            # the sym serves both roles).
             if sym not in self.signals:
                 continue
             if sids is not None and sym not in sids:

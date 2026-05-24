@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.2.6`
+        Version `1.2.7`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Refine real-value parsing and malformed token handling.
-- Continue the defensive-parser work without changing the legacy CLI contract.
-- Retain the same fixture set and interval-style search tests.
+        - Polish parser bounds and filtering safety checks.
+- Keep the external command surface stable for legacy users.
+- Carry forward the same sanitized VCD stimuli and unittest structure.
 
         ## Commands
 
