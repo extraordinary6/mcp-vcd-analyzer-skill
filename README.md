@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.2.10`
+        Version `1.2.11`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Improve defensive parsing and error surfacing across the 1.2 line.
-- Keep the public command set and legacy search interface stable.
-- Carry the same sanitized test suite forward.
+        - Refine recovery from malformed data tokens and skipped sections.
+- Continue tightening tolerant-reader behavior for imperfect traces.
+- Maintain the same repository structure and smoke tests.
 
         ## Commands
 

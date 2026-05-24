@@ -43,7 +43,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.2.10'
+__version__ = '1.2.11'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -475,7 +475,7 @@ class VCDParser:
         body = []
         done = False
 
-        with open(self.path, 'r', errors='replace') as f:
+        with open(self.path, 'r', encoding='utf-8', errors='replace') as f:
             while not done:
                 line = f.readline()
                 if not line:
@@ -758,7 +758,16 @@ class VCDParser:
                 hit = False
                 for pat in pats:
                     if any(ch in pat for ch in '*?'):
-                        hit = fnmatch.fnmatchcase(pl, pat)
+                        try:
+                            hit = fnmatch.fnmatchcase(pl, pat)
+                        except re.error:
+                            # fnmatch.translate can produce regex that
+                            # re.compile rejects on older Python versions
+                            # (e.g. some bracket constructs pre-3.9).
+                            # Modern Python normalizes these to never-match
+                            # but we catch defensively so a corrupt filter
+                            # never crashes the tool.
+                            hit = False
                     else:
                         hit = pat in pl
                     if hit:
@@ -772,7 +781,7 @@ class VCDParser:
         """Generator yielding all tokens from the data section."""
         for t in self._initial_tokens:
             yield t
-        with open(self.path, 'r', errors='replace') as f:
+        with open(self.path, 'r', encoding='utf-8', errors='replace') as f:
             f.seek(self._data_offset)
             for line in f:
                 for t in line.split():
@@ -1155,12 +1164,25 @@ def _parse_target_value(text):
 
 
 def _value_matches(value, target_raw, target_int):
-    if value == target_raw:
-        return True
-    if target_int is None:
-        return False
-    iv = val_to_int(value)
-    return iv is not None and iv == target_int
+    """Match a recorded value against a parsed search target.
+
+    Two-mode matching to avoid the binary/decimal collision:
+
+      - target_int is not None: the user supplied a numeric target
+        (0x.., 0b.., b.., or pure decimal). Match ONLY via numeric
+        equality. Without this rule, `--value 10` would match a 2-bit
+        signal currently showing "10" (binary 10 = decimal 2), because
+        the raw strings happen to be equal. The numeric path correctly
+        evaluates the recorded "10" as 2, which != 10.
+
+      - target_int is None: the target is non-numeric (x/z/mixed like
+        "1x10"). Numeric comparison can't apply; fall back to raw
+        string equality (both sides are already lowercased and trimmed).
+    """
+    if target_int is not None:
+        iv = val_to_int(value)
+        return iv is not None and iv == target_int
+    return value == target_raw
 
 
 def _event_groups(vcd, t0, t1, sids):
@@ -1183,6 +1205,13 @@ def _signal_value_intervals(vcd, t0, t1, sids):
 
     Each item is (sid, start_t, end_t, value, since_t). Unknown time before a
     signal's first observed value is omitted rather than guessed as x/undef.
+
+    Intervals are closed `[start_t, end_t]`. A transition exactly AT end_t
+    produces a degenerate `[end_t, end_t]` interval — this is the natural
+    semantics of a closed-interval representation and tells the Agent
+    "at time end_t this signal held value X". It is NOT filtered out; the
+    Agent reading the JSON understands a duration of zero as a point-in-time
+    boundary event.
     """
     end_t = t1
     if end_t is None:
