@@ -50,7 +50,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.3.3'
+__version__ = '1.3.4'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -679,6 +679,12 @@ class VCDParser:
                     bit_types[(sc, name)] = vtype
                     bit_select_singletons.append((sym, name, idx, sc, vtype))
                     continue
+                # A 1-bit reference written as a range (for example
+                # data[0:0]) is not a bit-exploded bus bit. Preserve the
+                # reference suffix in the displayed path instead of silently
+                # dropping it. Some simulators emit this non-canonical form.
+                standalone.append((sym, name + bit_str, 1, sc, vtype))
+                continue
             standalone.append((sym, name, w, sc, vtype))
 
         # Partition bit_groups: contiguous-from-0 with ≥2 bits → reassemble;
@@ -1020,94 +1026,108 @@ class VCDParser:
                 close()
 
     def scan_time_range(self):
-        """Min/max timestamps in the file. If any value_change occurs before
-        the first #T (an initial $dumpvars block), t_min is 0. Time is
-        observed-max (never less than the largest seen): malformed VCDs
-        with timestamps going backwards don't produce negative duration.
-        $comment / $vcdclose / unknown $keyword bodies are skipped only
-        when at a top-level position. Value-change body validation matches
-        iter_events so info/dump don't disagree on the same file."""
+        """Min/max timestamps in the file.
+
+        If any value_change occurs before the first #T (an initial $dumpvars
+        block), t_min is 0. Time is observed-max (never less than the largest
+        seen), so malformed VCDs with timestamps going backwards do not produce
+        negative duration. Value-change body validation mirrors iter_events()
+        closely enough that info/dump agree on malformed b/r/p bodies.
+
+        The underlying token generator owns an open file. Close it explicitly
+        on all paths instead of relying on garbage collection if a resource
+        error is raised while scanning a corrupt file.
+        """
         t_min = t_max = None
         saw_initial_data = False
         raw = self._data_tokens()
         pushback = []
+
         def _next():
             return pushback.pop() if pushback else next(raw, None)
+
         def _is_struct(t):
-            if t is None: return True
+            if t is None:
+                return True
             if t.startswith('#') and len(t) > 1 and t[1].isdigit():
-                # Declared identifier_code with #-form is not a timestamp
+                # Declared identifier_code with #-form is not a timestamp.
                 return t not in self.signals and t not in self._bit_map
             return False
 
-        while True:
-            tok = _next()
-            if tok is None:
-                break
-            if tok == '$end' or tok in _SIM_KEYWORDS:
-                continue
-            if tok.startswith('$'):
-                for t in raw:
-                    if t == '$end':
-                        break
-                continue
-            if tok.startswith('#') and len(tok) > 1 and tok[1].isdigit():
-                t = _parse_vcd_timestamp_token(tok)
-                if t is None:
+        try:
+            while True:
+                tok = _next()
+                if tok is None:
+                    break
+                if tok == '$end' or tok in _SIM_KEYWORDS:
                     continue
-                if t_min is None:
-                    t_min = 0 if saw_initial_data else t
-                t_max = t if t_max is None else max(t_max, t)
-                continue
-            # Value-change branches with body validation
-            first = tok[0] if tok else ''
-            if first in '01xXzZ' and len(tok) > 1:
-                if t_min is None:
-                    saw_initial_data = True
-            elif first in 'bB':
-                bits = tok[1:]
-                if not bits or any(c not in '01xXzZ' for c in bits):
+                if tok.startswith('$'):
+                    for t in raw:
+                        if t == '$end':
+                            break
                     continue
-                sym = _next()
-                if _is_struct(sym):
-                    if sym is not None:
-                        pushback.append(sym)
+                if tok.startswith('#') and len(tok) > 1 and tok[1].isdigit():
+                    t = _parse_vcd_timestamp_token(tok)
+                    if t is None:
+                        continue
+                    if t_min is None:
+                        t_min = 0 if saw_initial_data else t
+                    t_max = t if t_max is None else max(t_max, t)
                     continue
-                if t_min is None:
-                    saw_initial_data = True
-            elif first in 'rR':
-                body = tok[1:]
-                if len(body) > _REAL_MAX_LEN or not _REAL_RE.match(body):
-                    continue
-                sym = _next()
-                if _is_struct(sym):
-                    if sym is not None:
-                        pushback.append(sym)
-                    continue
-                if t_min is None:
-                    saw_initial_data = True
-            elif first == 'p':
-                # Validate strength tokens before consuming further
-                _s0 = _next()
-                if _s0 is None or len(_s0) != 1 or _s0 not in '01234567':
-                    if _s0 is not None:
+
+                # Value-change branches with body validation.
+                first = tok[0] if tok else ''
+                if first in '01xXzZ' and len(tok) > 1:
+                    if t_min is None:
+                        saw_initial_data = True
+                elif first in 'bB':
+                    bits = tok[1:]
+                    if not bits or any(c not in '01xXzZ' for c in bits):
+                        continue
+                    sym = _next()
+                    if _is_struct(sym):
+                        if sym is not None:
+                            pushback.append(sym)
+                        continue
+                    if t_min is None:
+                        saw_initial_data = True
+                elif first in 'rR':
+                    body = tok[1:]
+                    if len(body) > _REAL_MAX_LEN or not _REAL_RE.match(body):
+                        continue
+                    sym = _next()
+                    if _is_struct(sym):
+                        if sym is not None:
+                            pushback.append(sym)
+                        continue
+                    if t_min is None:
+                        saw_initial_data = True
+                elif first == 'p':
+                    _s0 = _next()
+                    if _s0 is None or len(_s0) != 1 or _s0 not in '01234567':
+                        if _s0 is not None:
+                            pushback.append(_s0)
+                        continue
+                    _s1 = _next()
+                    if _s1 is None or len(_s1) != 1 or _s1 not in '01234567':
+                        if _s1 is not None:
+                            pushback.append(_s1)
                         pushback.append(_s0)
-                    continue
-                _s1 = _next()
-                if _s1 is None or len(_s1) != 1 or _s1 not in '01234567':
-                    if _s1 is not None:
+                        continue
+                    sym = _next()
+                    if _is_struct(sym):
+                        if sym is not None:
+                            pushback.append(sym)
                         pushback.append(_s1)
-                    pushback.append(_s0)
-                    continue
-                sym = _next()
-                if _is_struct(sym):
-                    if sym is not None:
-                        pushback.append(sym)
-                    pushback.append(_s1)
-                    pushback.append(_s0)
-                    continue
-                if t_min is None:
-                    saw_initial_data = True
+                        pushback.append(_s0)
+                        continue
+                    if t_min is None:
+                        saw_initial_data = True
+        finally:
+            close = getattr(raw, 'close', None)
+            if close is not None:
+                close()
+
         if t_min is None and saw_initial_data:
             t_min = t_max = 0
         return t_min, t_max
@@ -1294,25 +1314,47 @@ def _parse_target_value(text):
         return raw, None
 
 
-def _value_matches(value, target_raw, target_int):
+def _is_4state_bits(text):
+    return text is not None and text != '' and all(c in '01xz' for c in text)
+
+
+def _left_extend_bits(bits, width):
+    """Apply VCD vector left-extension to a 4-state bit string.
+
+    When a dumped vector is shorter than its declared width, IEEE VCD
+    semantics extend the MSB leftward: x extends with x, z with z, and
+    0/1 with 0. Use the same rule for user 4-state targets so a condition
+    such as data=b1x0 can match an 8-bit stored value 000001x0 without
+    asking the Agent to spell out every leading zero.
+    """
+    if width is None or len(bits) >= width:
+        return bits
+    msb = bits[0]
+    pad = msb if msb in ('x', 'z') else '0'
+    return pad * (width - len(bits)) + bits
+
+
+def _value_matches(value, target_raw, target_int, width=None):
     """Match a recorded value against a parsed search target.
 
-    Two-mode matching to avoid the binary/decimal collision:
+    Numeric targets (decimal/hex/binary without x/z) match only by numeric
+    equality, avoiding the decimal/binary collision where target 10 would
+    otherwise raw-match a 2-bit value "10".
 
-      - target_int is not None: the user supplied a numeric target
-        (0x.., 0b.., b.., or pure decimal). Match ONLY via numeric
-        equality. Without this rule, `--value 10` would match a 2-bit
-        signal currently showing "10" (binary 10 = decimal 2), because
-        the raw strings happen to be equal. The numeric path correctly
-        evaluates the recorded "10" as 2, which != 10.
-
-      - target_int is None: the target is non-numeric (x/z/mixed like
-        "1x10"). Numeric comparison can't apply; fall back to raw
-        string equality (both sides are already lowercased and trimmed).
+    Non-numeric 4-state targets (for example b1x0 -> raw "1x0") match as
+    bit patterns. If the signal width is known, both the dumped value and the
+    target are left-extended to that width using VCD rules before comparison.
+    This preserves exact x/z semantics while avoiding the need to write every
+    leading zero for wide buses. Non-bit-string literals fall back to exact
+    string equality.
     """
     if target_int is not None:
         iv = val_to_int(value)
         return iv is not None and iv == target_int
+    if width is not None and _is_4state_bits(value) and _is_4state_bits(target_raw):
+        if len(target_raw) > width:
+            return False
+        return _left_extend_bits(value, width) == _left_extend_bits(target_raw, width)
     return value == target_raw
 
 
@@ -1324,11 +1366,12 @@ def _has_unknown(value):
     return value is None or 'x' in value or 'z' in value
 
 
-def _condition_match(value, op, target_raw, target_int):
+def _condition_match(value, op, target_raw, target_int, width=None):
     """Evaluate one resolved condition against a raw VCD value.
 
     Equality reuses the existing two-mode value matcher, so numeric targets
-    are compared numerically and mixed x/z literals are compared literally.
+    are compared numerically and mixed x/z literals are compared as 4-state
+    bit patterns, width-aware when the signal width is available.
 
     Inequality is deliberately stricter than `not _value_matches(...)`:
     x/z/undef do NOT satisfy `!=`. In RTL debug, unknown is not evidence that
@@ -1338,11 +1381,11 @@ def _condition_match(value, op, target_raw, target_int):
     if value is None:
         return False
     if op in ('=', '=='):
-        return _value_matches(value, target_raw, target_int)
+        return _value_matches(value, target_raw, target_int, width)
     if op == '!=':
         if _has_unknown(value):
             return False
-        return not _value_matches(value, target_raw, target_int)
+        return not _value_matches(value, target_raw, target_int, width)
     raise AssertionError('unsupported condition operator {}'.format(op))
 
 
@@ -1430,6 +1473,7 @@ def _resolve_conditions(vcd, text):
         c = dict(c)
         c['sid'] = sid
         c['path'] = vcd.signals[sid]['path']
+        c['width'] = vcd.signals[sid]['width']
         resolved.append(c)
     return resolved
 
@@ -1445,7 +1489,10 @@ def _resolve_show_sids(vcd, show_patterns):
     """
     if not show_patterns:
         return []
-    pats = _normalize_filter_patterns(show_patterns)
+    # argparse already normalizes --show through _normalize_filter_patterns;
+    # keep a string fallback for internal/programmatic callers.
+    pats = (_normalize_filter_patterns(show_patterns)
+            if isinstance(show_patterns, str) else list(show_patterns))
     if not pats:
         return []
 
@@ -1480,7 +1527,9 @@ def _resolve_show_sids(vcd, show_patterns):
 
 def _conditions_hold(state, conditions):
     for c in conditions:
-        if not _condition_match(state.get(c['sid']), c['op'], c['target_raw'], c['target_int']):
+        if not _condition_match(
+                state.get(c['sid']), c['op'], c['target_raw'],
+                c['target_int'], c.get('width')):
             return False
     return True
 
@@ -1917,7 +1966,8 @@ def cmd_compare(vcd, args):
     ts = vcd.ts_sec
     parts = args.at.split(',')
     if len(parts) != 2:
-        sys.exit('Error: --at needs two times separated by comma, e.g. --at 17.5us,17.7us')
+        raise _TimeParseError(
+            '--at needs two times separated by comma, e.g. --at 17.5us,17.7us')
     ta, tb = parse_time(parts[0].strip(), ts), parse_time(parts[1].strip(), ts)
     sids = vcd.match(args.filter)
     sa = _build_snapshot(vcd, ta, sids)
@@ -2064,10 +2114,9 @@ def cmd_search(vcd, args):
         return False
 
     for t, group in _event_groups(vcd, t0, t1, selected):
-        changed = set()
+        # Interval/segment mode only needs the current cross-section state;
+        # changed-mode edge detection is handled in its own branch above.
         for sid, val in group:
-            if state.get(sid) != val:
-                changed.add(sid)
             state[sid] = val
 
         cond_ok = _conditions_hold(state, conditions)

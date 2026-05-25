@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.3.3`
+        Version `1.3.4`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Continue polishing changed-mode event handling.
-- Tighten text and JSON truncation messaging around streaming search.
-- Retain the same sanitized condition-based fixture set.
+        - Add explicit helpers for 4-state bit detection and left-extension.
+- Make x/z pattern matching width-aware for condition search.
+- Extend the test suite around mixed known/unknown vector comparisons.
 
         ## Commands
 
