@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.3.2`
+        Version `1.3.3`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Add a pre-begin snapshot helper so changed-mode queries can see edges at the window boundary.
-- Keep the condition/show workflow intact while tightening event semantics.
-- Update the search fixtures and tests around changed-mode behavior.
+        - Continue polishing changed-mode event handling.
+- Tighten text and JSON truncation messaging around streaming search.
+- Retain the same sanitized condition-based fixture set.
 
         ## Commands
 
@@ -43,7 +43,8 @@ Commands:
 
 Global options:
   --json       Output compact structured JSON instead of text (time fields include *_ticks)
-  --limit N    Max rows/records to output; default 200; 0 = unlimited
+  --limit N    Max rows/records to emit; default 200; 0 = unlimited.
+               Streaming commands stop after detecting the first unshown result.
   --verbose    Show extra fields; if --limit is omitted, disables truncation
 
 Argument formats:
@@ -56,9 +57,12 @@ Argument formats:
   --at T          Time point for snapshot. For compare: two points comma-separated: --at 17.5us,17.7us
   --condition C   Comma-separated AND conditions: SIG=VAL, SIG==VAL, SIG!=VAL.
                   Condition signal patterns must match exactly one signal.
-                  Values use the same numeric/4-state matching as previous search values.
-  --show K1,K2    Optional associated signals to display while condition holds.
-  --changed K     Optional trigger signal; emit events only when this signal changes.
+                  SIG!=VAL does not match x/z/undef; use SIG=x to search unknown.
+                  Values use numeric or 4-state matching: 5, 0x5, b0101, b1x0z.
+  --show K1,K2    Optional associated signals to display while condition holds;
+                  segment mode splits whenever shown values change.
+  --changed K     Optional trigger signal; emit events only when this signal really changes.
+                  VCD event variables count each trigger; t=0 initialization is ignored.
 
 Examples:
   vcd_analyzer info sim.vcd
@@ -70,6 +74,7 @@ Examples:
   vcd_analyzer search sim.vcd --condition "state=5"
   vcd_analyzer search sim.vcd --condition "arvalid=1,arready=1" --show araddr,arlen,arid
   vcd_analyzer search sim.vcd --changed data_out --condition "valid=0" --show data_out,valid
+  vcd_analyzer search sim.vcd --condition "valid=x"
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
         ```
 

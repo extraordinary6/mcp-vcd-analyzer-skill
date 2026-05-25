@@ -15,7 +15,8 @@ Commands:
 
 Global options:
   --json       Output compact structured JSON instead of text (time fields include *_ticks)
-  --limit N    Max rows/records to output; default 200; 0 = unlimited
+  --limit N    Max rows/records to emit; default 200; 0 = unlimited.
+               Streaming commands stop after detecting the first unshown result.
   --verbose    Show extra fields; if --limit is omitted, disables truncation
 
 Argument formats:
@@ -28,9 +29,12 @@ Argument formats:
   --at T          Time point for snapshot. For compare: two points comma-separated: --at 17.5us,17.7us
   --condition C   Comma-separated AND conditions: SIG=VAL, SIG==VAL, SIG!=VAL.
                   Condition signal patterns must match exactly one signal.
-                  Values use the same numeric/4-state matching as previous search values.
-  --show K1,K2    Optional associated signals to display while condition holds.
-  --changed K     Optional trigger signal; emit events only when this signal changes.
+                  SIG!=VAL does not match x/z/undef; use SIG=x to search unknown.
+                  Values use numeric or 4-state matching: 5, 0x5, b0101, b1x0z.
+  --show K1,K2    Optional associated signals to display while condition holds;
+                  segment mode splits whenever shown values change.
+  --changed K     Optional trigger signal; emit events only when this signal really changes.
+                  VCD event variables count each trigger; t=0 initialization is ignored.
 
 Examples:
   vcd_analyzer info sim.vcd
@@ -42,10 +46,11 @@ Examples:
   vcd_analyzer search sim.vcd --condition "state=5"
   vcd_analyzer search sim.vcd --condition "arvalid=1,arready=1" --show araddr,arlen,arid
   vcd_analyzer search sim.vcd --changed data_out --condition "valid=0" --show data_out,valid
+  vcd_analyzer search sim.vcd --condition "valid=x"
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.3.2'
+__version__ = '1.3.3'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -1190,16 +1195,15 @@ def _build_snapshot(vcd, t_at, sids=None):
 def _build_snapshot_before(vcd, t_at, sids=None):
     """Replay from start up to, but excluding, t_at.
 
-    Used by search --changed.  A value_change exactly at --begin must remain
-    observable as a transition, while t=0 dumpvars-style initialization is
-    still not treated as a real change by the changed-mode loop.
+    Used by search --changed. A value_change exactly at --begin must remain
+    observable as a transition. Because VCD timestamps are integer ticks, the
+    exclusive snapshot is simply the inclusive snapshot at t_at - 1. At t=0
+    there is no prior state; initialization is handled explicitly by the
+    changed-mode loop and is not reported as a real change.
     """
-    state = {}
-    for _t, sid, val in vcd.iter_events(0, t_at, sids):
-        if _t >= t_at:
-            break
-        state[sid] = val
-    return state
+    if t_at <= 0:
+        return {}
+    return _build_snapshot(vcd, t_at - 1, sids)
 
 
 def _parse_target_value(text):
@@ -1431,16 +1435,47 @@ def _resolve_conditions(vcd, text):
 
 
 def _resolve_show_sids(vcd, show_patterns):
-    """Resolve --show patterns. Unlike conditions, show may match many signals."""
+    """Resolve --show patterns to one or more signal ids.
+
+    Show positions are allowed to match multiple signals, but an exact full
+    path still wins over substring matching for that specific pattern. This
+    keeps `--show tb.data` from unexpectedly also selecting `tb.data_out`;
+    users who want broad matching can still write `--show data` or use glob
+    patterns such as `--show "*data*"`.
+    """
     if not show_patterns:
         return []
     pats = _normalize_filter_patterns(show_patterns)
     if not pats:
         return []
-    sids = vcd.match(pats)
-    if not sids:
+
+    selected = set()
+    missing = []
+    for pat in pats:
+        pat_text = str(pat).strip()
+        exact = set()
+        if '*' not in pat_text and '?' not in pat_text:
+            pl = pat_text.lower()
+            for sid, info in vcd.signals.items():
+                for path in info['aliases']:
+                    if path.lower() == pl:
+                        exact.add(sid)
+            if exact:
+                selected.update(exact)
+                continue
+
+        matched = vcd.match([pat_text])
+        if matched:
+            selected.update(matched)
+        else:
+            missing.append(pat_text)
+
+    if missing:
+        raise _ConditionParseError(
+            '--show matches no signals: {}'.format(', '.join(missing)))
+    if not selected:
         raise _ConditionParseError('--show matches no signals')
-    return sorted(sids, key=lambda sid: vcd.signals[sid]['path'])
+    return sorted(selected, key=lambda sid: vcd.signals[sid]['path'])
 
 
 def _conditions_hold(state, conditions):
@@ -1952,7 +1987,17 @@ def cmd_search(vcd, args):
             changed = set()
             for sid, val in group:
                 old_val = state.get(sid)
-                if not (t == 0 and old_val is None) and old_val != val:
+                # For ordinary state-carrying signals, --changed means the
+                # value is different from the previous known state. VCD
+                # variables of type `event` are different: every value_change
+                # token is a trigger even if the dumped marker text repeats.
+                # In both cases, t=0 dumpvars-style initialization is not a
+                # real change.
+                if t == 0 and old_val is None:
+                    pass
+                elif vcd.signals[sid].get('type') == 'event':
+                    changed.add(sid)
+                elif old_val != val:
                     changed.add(sid)
                 state[sid] = val
             if changed_sid not in changed:
@@ -2126,7 +2171,7 @@ def _add_common(sp):
     sp.add_argument('--json', action='store_true', default=argparse.SUPPRESS,
                     help='output compact structured JSON instead of text')
     sp.add_argument('--limit', type=int, default=argparse.SUPPRESS,
-                    help='max rows/records to output; default 200; 0 = unlimited')
+                    help='max rows/records to emit; default 200; 0 = unlimited; streaming commands stop after the first unshown result')
     sp.add_argument('--verbose', action='store_true', default=argparse.SUPPRESS,
                     help='show extra fields; if --limit is omitted, disables truncation')
 
@@ -2139,7 +2184,7 @@ def main():
     p.add_argument('--json', action='store_true',
                    help='output compact structured JSON instead of text')
     p.add_argument('--limit', type=int, default=None,
-                   help='max rows/records to output; default 200; 0 = unlimited')
+                   help='max rows/records to emit; default 200; 0 = unlimited; streaming commands stop after the first unshown result')
     p.add_argument('--verbose', action='store_true',
                    help='show extra fields; if --limit is omitted, disables truncation')
     p.add_argument('--version', action='version', version='%(prog)s ' + __version__)
@@ -2170,11 +2215,11 @@ def main():
     sp = sub.add_parser('search', help='conditional search and associated signal observation')
     sp.add_argument('file', metavar='<file>'); _add_time_args(sp); _add_common(sp)
     sp.add_argument('--condition', metavar='COND', required=True,
-                    help='comma-separated AND conditions, e.g. "valid=1,ready=1"')
+                    help='comma-separated AND conditions, e.g. "valid=1,ready=1"; != does not match x/z/undef')
     sp.add_argument('--show', metavar='PAT1,PAT2,...', type=_normalize_filter_patterns,
-                    help='signals to display while the condition holds')
+                    help='signals to display while the condition holds; output segments split when shown values change')
     sp.add_argument('--changed', metavar='PATTERN',
-                    help='emit events only when this signal changes; must match exactly one signal')
+                    help='emit events only when this signal really changes; VCD event vars count each trigger; must match exactly one signal')
 
     args = p.parse_args()
     if not args.cmd:
