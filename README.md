@@ -1,91 +1,69 @@
-        # VCD Analyzer
+# VCD Analyzer
 
-        Version `1.3.7`
+Command-line helper for inspecting Verilog VCD waveforms during RTL debug.
+Built for agent-assisted and interactive use.
 
-        Author: `neveltyc <neveltyc@gmail.com>`
+## Quick start
 
-        ## Overview
+```bash
+python vcd_analyzer.py info sim.vcd
+python vcd_analyzer.py list sim.vcd --filter clk,rst
+python vcd_analyzer.py dump sim.vcd --begin 100ns --end 200ns --filter state
+python vcd_analyzer.py search sim.vcd --condition "valid=1,ready=1" --show data
+```
 
-        `vcd_analyzer.py` is a command-line helper for inspecting Verilog VCD waveforms during RTL debug.
+Full usage details and all argument formats are in `python vcd_analyzer.py --help`
+or in the docstring at the top of [vcd_analyzer.py](vcd_analyzer.py).
 
-        ## Highlights
+## Commands
 
-        - Replace fnmatch-based wildcard matching with a literal-bracket glob-lite matcher.
-- Use declaration-time scope metadata when reporting scopes for escaped identifiers.
-- Keep the latest sanitized condition-search regression suite in place.
+| Command    | Purpose |
+|------------|---------|
+| `info`     | File overview: timescale, signal count, time span, scopes |
+| `list`     | List signals with path and bit width |
+| `dump`     | Print value-change events in time order |
+| `summary`  | Per-signal window stats: active/static, change count, rise/fall edges |
+| `snapshot` | Known signal values at a given time point |
+| `compare`  | Diff signal values between two time points |
+| `search`   | Condition-based search with optional --show and --changed observation |
 
-        ## Commands
+## JSON output
 
-        - `info`
-- `list`
-- `dump`
-- `summary`
-- `snapshot`
-- `compare`
-- `search`
+All commands support `--json` for compact structured output. Time fields include
+both human-readable (`_h`) and raw tick (`_ticks`) forms.
 
-        ## Usage
+```bash
+python vcd_analyzer.py --json info sim.vcd
+python vcd_analyzer.py --json search sim.vcd --condition "state=5" --show data
+```
 
-        ```text
-        VCD waveform analyzer for Agent-based RTL debug.
+## Project structure
 
-Usage: vcd_analyzer [--json] <command> <file> [options]
+```
+vcd_analyzer.py       Main script (single-file, stdlib only)
+tests/                unittest-based regression suite
+tests/fixtures/       Sanitized VCD fixtures (generic names)
+version_notes/        Per-version change logs
+archive/              Historical version snapshots
+```
 
-Commands:
-  info       <file>                               File overview (timescale, signal count, time span, scopes)
-  list       <file> [--filter K1,K2]               List signals with path and bit width
-  dump       <file> [--begin T] [--end T] [--filter K1,K2]   Print signal value changes in time order
-  summary    <file> [--begin T] [--end T] [--filter K1,K2]   Per-signal stats: change count, unique values, static detection
-  snapshot   <file> --at T [--filter K1,K2]        Known signal values at a given time point
-  compare    <file> --at T1,T2 [--filter K1,K2]    Diff signal values between two time points
-  search     <file> --condition C [--show K1,K2] [--changed K] [--begin T] [--end T]
-                                                        Conditional search and associated signal observation
+## Tests
 
-Global options:
-  --json       Output compact structured JSON instead of text (time fields include *_ticks)
-  --limit N    Max rows/records to emit; default 200; 0 = unlimited.
-               Streaming commands stop after detecting the first unshown result.
-  --verbose    Show extra fields; if --limit is omitted, disables truncation
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
 
-Argument formats:
-  <file>          VCD file path
-  --filter K1,K2  Comma-separated patterns. Plain text uses case-insensitive substring match;
-                  patterns containing * or ? use case-insensitive glob match.
-                  e.g. --filter clk,rst   --filter '*_valid,*_ready,*_data'   --filter 'top.u_dma.*'
-  --begin T       Start time with optional unit suffix: 0, 100ns, 17.5us, 1ms, 500ps, 200fs
-  --end T         End time, same format as --begin. Omit for no upper bound
-  --at T          Time point for snapshot. For compare: two points comma-separated: --at 17.5us,17.7us
-  --condition C   Comma-separated AND conditions: SIG=VAL, SIG==VAL, SIG!=VAL.
-                  Condition signal patterns must match exactly one signal.
-                  SIG!=VAL does not match x/z/undef; use SIG=x to search unknown.
-                  Values use numeric or 4-state matching: 5, 0x5, b0101, b1x0z.
-  --show K1,K2    Optional associated signals to display while condition holds;
-                  segment mode splits whenever shown values change.
-  --changed K     Optional trigger signal; emit events only when this signal really changes.
-                  For ordinary signals, first observed values are not treated as changes.
-                  VCD event variables count each trigger; t=0 initialization is ignored.
+## Version history
 
-Examples:
-  vcd_analyzer info sim.vcd
-  vcd_analyzer list sim.vcd --filter tdata,tvalid,tready
-  vcd_analyzer dump sim.vcd --begin 17.5us --end 17.6us --filter clk,rst,state
-  vcd_analyzer summary sim.vcd --filter dll_st,locked
-  vcd_analyzer snapshot sim.vcd --at 17.55us --filter init_done,state
-  vcd_analyzer compare sim.vcd --at 17.535us,17.56us --filter init_done,link_active,state
-  vcd_analyzer search sim.vcd --condition "state=5"
-  vcd_analyzer search sim.vcd --condition "arvalid=1,arready=1" --show araddr,arlen,arid
-  vcd_analyzer search sim.vcd --changed data_out --condition "valid=0" --show data_out,valid
-  vcd_analyzer search sim.vcd --condition "valid=x"
-  vcd_analyzer --json summary sim.vcd --filter tvalid,tready
-        ```
+Detailed change logs in [version_notes/](version_notes/).
 
-        ## Tests
+- `1.3.9` — Eliminate duplicated value-change parsing
+- `1.3.8` — Harden input validation and error reporting
+- `1.3.7` — Fix literal bus-range globs and escaped-scope reporting
+- `1.3.0` — Redesign search around conditions and observations
+- `1.0.0` — Initial public release
 
-        The repository ships with a sanitized unittest-based regression library under `tests/`.
-        The VCD fixtures use generic module and signal names and do not preserve any private customer paths.
+## Author
 
-        Run the tests with:
+`neveltyc <neveltyc@gmail.com>`
 
-        ```bash
-        python -m unittest discover -s tests -p "test_*.py"
-        ```

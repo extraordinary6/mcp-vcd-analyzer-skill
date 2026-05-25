@@ -9,3 +9,6 @@ vcd_analyzer_1_3_7.py
 vcd_analyzer_1_3_6_with_tests.zip
 _fixture_*.vcd
 _rebuild_history.py
+_generate_version_notes.py
+publish_releases.ps1
+
