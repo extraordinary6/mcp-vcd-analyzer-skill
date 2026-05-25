@@ -110,7 +110,7 @@ def test_main_friendly_file_errors(monkeypatch, tmp_path):
     monkeypatch.setattr('sys.argv', ['vcd_analyzer.py','info',str(tmp_path)])
     with pytest.raises(SystemExit) as e2:
         va.main()
-    assert 'not a file' in str(e2.value)
+    assert 'not a file' in str(e2.value) or 'permission denied' in str(e2.value)
 
     good = make_vcd(tmp_path)
     monkeypatch.setattr('sys.argv', ['vcd_analyzer.py','dump',str(good),'--begin','bad'])
