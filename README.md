@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.3.4`
+        Version `1.3.5`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Add explicit helpers for 4-state bit detection and left-extension.
-- Make x/z pattern matching width-aware for condition search.
-- Extend the test suite around mixed known/unknown vector comparisons.
+        - Delete the dead interval helper left behind by the search redesign.
+- Keep the user-facing command set stable while simplifying internals.
+- Carry forward the sanitized condition-search regression cases.
 
         ## Commands
 
@@ -62,6 +62,7 @@ Argument formats:
   --show K1,K2    Optional associated signals to display while condition holds;
                   segment mode splits whenever shown values change.
   --changed K     Optional trigger signal; emit events only when this signal really changes.
+                  For ordinary signals, first observed values are not treated as changes.
                   VCD event variables count each trigger; t=0 initialization is ignored.
 
 Examples:

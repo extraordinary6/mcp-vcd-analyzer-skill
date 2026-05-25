@@ -34,6 +34,7 @@ Argument formats:
   --show K1,K2    Optional associated signals to display while condition holds;
                   segment mode splits whenever shown values change.
   --changed K     Optional trigger signal; emit events only when this signal really changes.
+                  For ordinary signals, first observed values are not treated as changes.
                   VCD event variables count each trigger; t=0 initialization is ignored.
 
 Examples:
@@ -50,7 +51,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.3.4'
+__version__ = '1.3.5'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -652,6 +653,7 @@ class VCDParser:
         # as individual bit-select references.
         bit_groups = defaultdict(dict)  # (scope, base_name) -> {bit_idx: sym}
         bit_types = {}                   # (scope, base_name) -> vtype
+        duplicate_bit_groups = set()      # groups with duplicate bit indices; never reassemble
         standalone = []
         bit_select_singletons = []       # (sym, name, idx, sc, vtype)
 
@@ -665,8 +667,17 @@ class VCDParser:
                         # a standalone signal (its bit_str folded back).
                         standalone.append((sym, name + bit_str, 1, sc, vtype))
                         continue
-                    group = bit_groups[(sc, name)]
-                    group[idx] = sym
+                    group_key = (sc, name)
+                    group = bit_groups[group_key]
+                    if idx in group:
+                        # Illegal VCD: duplicate bit-select declaration for the
+                        # same reconstructed bus bit.  Do not silently let the
+                        # later symbol overwrite the earlier one; mark the group
+                        # non-reassemblable so all raw bit-select declarations
+                        # remain visible as standalone signals.
+                        duplicate_bit_groups.add(group_key)
+                    else:
+                        group[idx] = sym
                     # Resource cap: refuse to allocate gigantic synthesized
                     # buses (per-call template copy cost scales linearly).
                     # Default 65536 is 128× typical QuestaSim bit-bus size;
@@ -698,8 +709,10 @@ class VCDParser:
         # billion-element set (gigabytes of RAM). Indices [0..max] form a
         # contiguous run iff: count == max+1 AND 0 is present. Both checks
         # are O(1) on dict_keys.
-        non_contiguous = set()
+        non_contiguous = set(duplicate_bit_groups)
         for key, bits in bit_groups.items():
+            if key in non_contiguous:
+                continue
             indices = bits.keys()
             n = len(indices)
             if n < 2:
@@ -959,6 +972,11 @@ class VCDParser:
                     # before consuming further tokens so a malformed
                     # 'pH #10 1!' doesn't swallow the #10 timestamp.
                     state = tok[1:] if len(tok) > 1 else ''
+                    # Port state is one or more Extended VCD state characters.
+                    # Reject empty/unknown state strings instead of inventing an
+                    # x event from malformed input such as plain 'p 0 6 !'.
+                    if not state or any(c not in _PORT_STATE for c in state):
+                        continue
                     _s0 = _next()
                     if _s0 is None or len(_s0) != 1 or _s0 not in '01234567':
                         if _s0 is not None:
@@ -977,7 +995,7 @@ class VCDParser:
                         pushback.append(_s1)
                         pushback.append(_s0)
                         continue
-                    val = _PORT_STATE.get(state, 'x')
+                    val = ''.join(_PORT_STATE[c] for c in state)
                 else:
                     continue  # unparseable token
     
@@ -1103,6 +1121,9 @@ class VCDParser:
                     if t_min is None:
                         saw_initial_data = True
                 elif first == 'p':
+                    state = tok[1:] if len(tok) > 1 else ''
+                    if not state or any(c not in _PORT_STATE for c in state):
+                        continue
                     _s0 = _next()
                     if _s0 is None or len(_s0) != 1 or _s0 not in '01234567':
                         if _s0 is not None:
@@ -1489,10 +1510,10 @@ def _resolve_show_sids(vcd, show_patterns):
     """
     if not show_patterns:
         return []
-    # argparse already normalizes --show through _normalize_filter_patterns;
-    # keep a string fallback for internal/programmatic callers.
-    pats = (_normalize_filter_patterns(show_patterns)
-            if isinstance(show_patterns, str) else list(show_patterns))
+    # Normalize even for list inputs.  argparse already does this for CLI
+    # strings, but repeating the bounded, idempotent normalization keeps the
+    # helper safe for programmatic callers as well.
+    pats = _normalize_filter_patterns(show_patterns)
     if not pats:
         return []
 
@@ -1584,42 +1605,6 @@ def _event_groups(vcd, t0, t1, sids):
         group.append((sid, val))
     if cur_t is not None:
         yield cur_t, group
-
-
-def _signal_value_intervals(vcd, t0, t1, sids):
-    """Yield stable known-value intervals per selected signal.
-
-    Each item is (sid, start_t, end_t, value, since_t). Unknown time before a
-    signal's first observed value is omitted rather than guessed as x/undef.
-
-    Intervals are closed `[start_t, end_t]`. A transition exactly AT end_t
-    produces a degenerate `[end_t, end_t]` interval — this is the natural
-    semantics of a closed-interval representation and tells the Agent
-    "at time end_t this signal held value X". It is NOT filtered out; the
-    Agent reading the JSON understands a duration of zero as a point-in-time
-    boundary event.
-    """
-    end_t = t1
-    if end_t is None:
-        _mn, mx = vcd.scan_time_range()
-        end_t = mx if mx is not None else t0
-
-    state = _build_snapshot(vcd, t0, sids)
-    start = {sid: t0 for sid in state}
-    since = {sid: None for sid in state}
-    # Search/dump at t0 treat the state at t0 as the known starting state.
-    for t, group in _event_groups(vcd, t0, end_t, sids):
-        if t <= t0:
-            continue
-        for sid, val in group:
-            if sid in state and start[sid] < t:
-                yield sid, start[sid], t, state[sid], since.get(sid)
-            state[sid] = val
-            start[sid] = t
-            since[sid] = t
-    for sid, val in state.items():
-        if start[sid] <= end_t:
-            yield sid, start[sid], end_t, val, since.get(sid)
 
 
 def _summary_rows(vcd, t0, t1, sids):
@@ -2047,6 +2032,12 @@ def cmd_search(vcd, args):
                     pass
                 elif vcd.signals[sid].get('type') == 'event':
                     changed.add(sid)
+                elif old_val is None:
+                    # First observed value for an ordinary state signal is a
+                    # definition, not evidence of a transition.  This matters
+                    # when --begin is after time 0 and a signal is first dumped
+                    # inside the query window.
+                    pass
                 elif old_val != val:
                     changed.add(sid)
                 state[sid] = val
@@ -2114,6 +2105,11 @@ def cmd_search(vcd, args):
         return False
 
     for t, group in _event_groups(vcd, t0, t1, selected):
+        # _build_snapshot(vcd, t0) already applied all value_changes at t0.
+        # Replaying the same group is idempotent for legal VCD, but skipping
+        # it avoids duplicate work for large initial dumps at the window start.
+        if t <= t0:
+            continue
         # Interval/segment mode only needs the current cross-section state;
         # changed-mode edge detection is handled in its own branch above.
         for sid, val in group:
