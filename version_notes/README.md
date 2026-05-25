@@ -33,3 +33,6 @@ These notes document the reconstructed `vcd_analyzer` history one version at a t
 - [v1.3.5](./v1.3.5.md)
 - [v1.3.6](./v1.3.6.md)
 - [v1.3.7](./v1.3.7.md)
+- [v1.3.8](./v1.3.8.md)
+- [v1.3.9](./v1.3.9.md)
+
