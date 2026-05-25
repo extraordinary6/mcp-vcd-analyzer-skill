@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.2.1`
+        Version `1.2.2`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Clean up common CLI output paths after the 1.2.0 reshuffle.
-- Keep the command surface stable while improving presentation details.
-- Carry forward the same sanitized fixtures and unittest harness.
+        - Add richer begin/end time metadata helpers for JSON-oriented outputs.
+- Keep the legacy search and summary workflow intact.
+- Refresh the historical test fixture set with the restored archive snapshot.
 
         ## Commands
 
@@ -41,7 +41,7 @@ Commands:
   search     <file> --value V [--signal K] [--begin T] [--end T] [--filter K1,K2]   Find intervals where signal state equals a value
 
 Global options:
-  --json       Output compact structured JSON instead of text
+  --json       Output compact structured JSON instead of text (time fields include *_ticks)
   --limit N    Max rows/records to output; default 200; 0 = unlimited
   --verbose    Show extra fields; if --limit is omitted, disables truncation
 

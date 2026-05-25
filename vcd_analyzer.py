@@ -13,7 +13,7 @@ Commands:
   search     <file> --value V [--signal K] [--begin T] [--end T] [--filter K1,K2]   Find intervals where signal state equals a value
 
 Global options:
-  --json       Output compact structured JSON instead of text
+  --json       Output compact structured JSON instead of text (time fields include *_ticks)
   --limit N    Max rows/records to output; default 200; 0 = unlimited
   --verbose    Show extra fields; if --limit is omitted, disables truncation
 
@@ -43,7 +43,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.2.1'
+__version__ = '1.2.2'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -755,6 +755,11 @@ def _fmt_maybe(value, info):
     return fmt_val(value, info) if value is not None else '(undef)'
 
 
+def _time_pair(prefix, t, ts):
+    """Return both integer ticks and human-readable time for JSON outputs."""
+    return {prefix + '_ticks': t, prefix + '_h': fmt_time(t, ts) if t is not None else None}
+
+
 def _build_snapshot(vcd, t_at, sids=None):
     """Replay from start to t_at, return known {sig_id: value} only."""
     state = {}
@@ -841,30 +846,48 @@ def _summary_rows(vcd, t0, t1, sids):
     Static means known at t0 and no value changes after t0 inside the window.
     Undefined means selected but not known at t0 and no value changes inside
     the window. No unknown values are invented.
+
+    For 1-bit signals, rise/fall counts are reported for clean 0->1 and 1->0
+    transitions only. x/z-related transitions still count as changes, but not
+    as rises/falls.
     """
     selected = _selected_sids(vcd, sids)
     initial = _build_snapshot(vcd, t0, selected)
     stats = {}
     for sid, val in initial.items():
+        info = vcd.signals[sid]
         stats[sid] = {
             'changes': 0, 'first_at': None, 'last_at': None,
-            'initial': val, 'last': val, 'unique': {val}
+            'initial': val, 'last': val, 'unique': {val},
+            'prev': val, 'rise_count': 0 if info['width'] == 1 else None,
+            'fall_count': 0 if info['width'] == 1 else None,
         }
     for t, group in _event_groups(vcd, t0, t1, selected):
         if t <= t0:
             continue
         for sid, val in group:
+            info = vcd.signals[sid]
+            is_scalar = info['width'] == 1
             if sid not in stats:
                 stats[sid] = {
                     'changes': 0, 'first_at': None, 'last_at': None,
-                    'initial': None, 'last': None, 'unique': set()
+                    'initial': None, 'last': None, 'unique': set(),
+                    'prev': None, 'rise_count': 0 if is_scalar else None,
+                    'fall_count': 0 if is_scalar else None,
                 }
             s = stats[sid]
+            prev = s.get('prev')
+            if is_scalar:
+                if prev == '0' and val == '1':
+                    s['rise_count'] += 1
+                elif prev == '1' and val == '0':
+                    s['fall_count'] += 1
             s['changes'] += 1
             if s['first_at'] is None:
                 s['first_at'] = t
             s['last_at'] = t
             s['last'] = val
+            s['prev'] = val
             s['unique'].add(val)
 
     rows = []
@@ -877,12 +900,18 @@ def _summary_rows(vcd, t0, t1, sids):
             'path': info['path'],
             'value': fmt_val(s['last'], info) if kind == 'static' else None,
             'changes': s['changes'],
+            'rise_count': s['rise_count'],
+            'fall_count': s['fall_count'],
             'init': _fmt_maybe(s['initial'], info),
             'last': _fmt_maybe(s['last'], info),
         }
         if s['first_at'] is not None:
+            row['first_at_ticks'] = s['first_at']
             row['first_at'] = fmt_time(s['first_at'], vcd.ts_sec)
+            row['first_at_h'] = row['first_at']
+            row['last_at_ticks'] = s['last_at']
             row['last_at'] = fmt_time(s['last_at'], vcd.ts_sec)
+            row['last_at_h'] = row['last_at']
         if s['unique']:
             row['unique'] = len(s['unique'])
         row['_width'] = info['width']
@@ -896,7 +925,6 @@ def _summary_rows(vcd, t0, t1, sids):
         'static': sum(1 for r in rows if r['kind'] == 'static'),
     }
     return rows, undefined, counts
-
 
 def _public_row(row, verbose=False):
     r = dict(row)
@@ -921,8 +949,14 @@ def cmd_info(vcd, args):
         'synthesized_buses': len(synth),
         'var_types': dict(sorted(vcd.raw_type_counts.items(), key=lambda x: -x[1])),
         'time_min': fmt_time(t_min, ts) if t_min is not None else None,
+        'time_min_ticks': t_min,
+        'time_min_h': fmt_time(t_min, ts) if t_min is not None else None,
         'time_max': fmt_time(t_max, ts) if t_max is not None else None,
+        'time_max_ticks': t_max,
+        'time_max_h': fmt_time(t_max, ts) if t_max is not None else None,
         'duration': fmt_time(t_max - t_min, ts) if t_min is not None and t_max is not None else None,
+        'duration_ticks': (t_max - t_min) if t_min is not None and t_max is not None else None,
+        'duration_h': fmt_time(t_max - t_min, ts) if t_min is not None and t_max is not None else None,
         'scopes': sorted(set(
             '.'.join(v['path'].split('.')[:-1]) for v in vcd.signals.values() if '.' in v['path']
         )),
@@ -989,7 +1023,8 @@ def cmd_dump(vcd, args):
         total += 1
         if limit == 0 or len(events) < limit:
             info = vcd.signals[sid]
-            e = {'time': t, 'time_h': fmt_time(t, ts), 'path': info['path'], 'value': fmt_val(val, info)}
+            e = {'time': t, 'time_ticks': t, 'time_h': fmt_time(t, ts),
+                 'path': info['path'], 'value': fmt_val(val, info)}
             if getattr(args, 'verbose', False):
                 e['width'] = info['width']
                 e['type'] = info.get('type', 'wire')
@@ -1030,14 +1065,18 @@ def cmd_summary(vcd, args):
         for sid in undef_sids:
             info = vcd.signals[sid]
             ordered.append({'kind': 'undefined', 'path': info['path'], 'value': None,
-                            'changes': 0, 'init': '(undef)', 'last': '(undef)',
+                            'changes': 0, 'rise_count': 0 if info['width'] == 1 else None,
+                            'fall_count': 0 if info['width'] == 1 else None,
+                            'init': '(undef)', 'last': '(undef)',
                             '_width': info['width'], '_type': info.get('type', 'wire')})
     limit = _limit(args, 'summary')
     shown, trunc = _clip(ordered, limit)
     begin_h = fmt_time(t0, ts)
     end_h = fmt_time(t1, ts) if t1 is not None else None
     if args.json:
-        _json({'window': {'begin': begin_h, 'end': end_h}, **counts,
+        _json({'window': {'begin': begin_h, 'end': end_h,
+                          'begin_ticks': t0, 'begin_h': begin_h,
+                          'end_ticks': t1, 'end_h': end_h}, **counts,
                'shown': len(shown), 'truncated': trunc,
                'rows': [_public_row(r, getattr(args, 'verbose', False)) for r in shown]})
         return
@@ -1052,12 +1091,16 @@ def cmd_summary(vcd, args):
             print('\n{}'.format(current.upper()))
         if r['kind'] == 'active':
             if getattr(args, 'verbose', False):
-                print('  {:<45} w={} {} chg={} init={} last={} first@{} last@{} uniq={}'.format(
-                    r['path'], r['_width'], r['_type'], r['changes'], r['init'], r['last'],
+                edge = '' if r.get('rise_count') is None else ' r={} f={}'.format(
+                    r.get('rise_count', 0), r.get('fall_count', 0))
+                print('  {:<45} w={} {} chg={}{} init={} last={} first@{} last@{} uniq={}'.format(
+                    r['path'], r['_width'], r['_type'], r['changes'], edge, r['init'], r['last'],
                     r.get('first_at', '-'), r.get('last_at', '-'), r.get('unique', 0)))
             else:
-                print('  {:<45} chg={} init={} last={}'.format(
-                    r['path'], r['changes'], r['init'], r['last']))
+                edge = '' if r.get('rise_count') is None else ' r={} f={}'.format(
+                    r.get('rise_count', 0), r.get('fall_count', 0))
+                print('  {:<45} chg={}{} init={} last={}'.format(
+                    r['path'], r['changes'], edge, r['init'], r['last']))
         elif r['kind'] == 'static':
             if getattr(args, 'verbose', False):
                 print('  {:<45} w={} {} value={}'.format(r['path'], r['_width'], r['_type'], r['value']))
@@ -1094,7 +1137,8 @@ def cmd_snapshot(vcd, args):
     limit = _limit(args, 'snapshot')
     shown, trunc = _clip(rows, limit)
     if args.json:
-        _json({'at': fmt_time(t_at, ts), 'selected': len(selected), 'known': len(state),
+        _json({'at': fmt_time(t_at, ts), 'at_ticks': t_at, 'at_h': fmt_time(t_at, ts),
+               'selected': len(selected), 'known': len(state),
                'undefined': len(undef), 'shown': len(shown), 'truncated': trunc,
                'signals': shown})
         return
@@ -1139,7 +1183,8 @@ def cmd_compare(vcd, args):
     limit = _limit(args, 'compare')
     shown, trunc = _clip(diffs, limit)
     if args.json:
-        _json({'t1': fmt_time(ta, ts), 't2': fmt_time(tb, ts),
+        _json({'t1': fmt_time(ta, ts), 't1_ticks': ta, 't1_h': fmt_time(ta, ts),
+               't2': fmt_time(tb, ts), 't2_ticks': tb, 't2_h': fmt_time(tb, ts),
                'total': len(diffs), 'shown': len(shown), 'truncated': trunc,
                'diffs': shown})
     else:
@@ -1166,7 +1211,8 @@ def cmd_search(vcd, args):
     if not selected:
         msg = 'No signals match the given filter'
         if args.json:
-            _json({'begin': fmt_time(t0, ts), 'end': fmt_time(t1, ts),
+            _json({'begin': fmt_time(t0, ts), 'begin_ticks': t0, 'begin_h': fmt_time(t0, ts),
+                   'end': fmt_time(t1, ts), 'end_ticks': t1, 'end_h': fmt_time(t1, ts),
                    'total': 0, 'shown': 0, 'truncated': False, 'matches': [], 'message': msg})
         else:
             print(msg)
@@ -1178,17 +1224,21 @@ def cmd_search(vcd, args):
         known.add(sid)
         if _value_matches(val, target_raw, target_int):
             info = vcd.signals[sid]
-            m = {'begin': fmt_time(a, ts), 'end': fmt_time(b, ts),
+            m = {'begin': fmt_time(a, ts), 'begin_ticks': a, 'begin_h': fmt_time(a, ts),
+                 'end': fmt_time(b, ts), 'end_ticks': b, 'end_h': fmt_time(b, ts),
                  'path': info['path'], 'value': fmt_val(val, info)}
             if getattr(args, 'verbose', False):
                 m['width'] = info['width']
                 m['type'] = info.get('type', 'wire')
                 m['since'] = fmt_time(since, ts) if since is not None else None
+                m['since_ticks'] = since
+                m['since_h'] = fmt_time(since, ts) if since is not None else None
             matches.append(m)
     limit = _limit(args, 'search')
     shown, trunc = _clip(matches, limit)
     if args.json:
-        _json({'begin': fmt_time(t0, ts), 'end': fmt_time(t1, ts),
+        _json({'begin': fmt_time(t0, ts), 'begin_ticks': t0, 'begin_h': fmt_time(t0, ts),
+               'end': fmt_time(t1, ts), 'end_ticks': t1, 'end_h': fmt_time(t1, ts),
                'searched_signals': len(selected), 'defined_signals': len(known),
                'target': args.value, 'total': len(matches), 'shown': len(shown),
                'truncated': trunc, 'matches': shown})
