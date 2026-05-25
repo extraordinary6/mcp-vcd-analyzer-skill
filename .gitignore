@@ -1,7 +1,9 @@
 .pytest_cache/
+__pycache__/
 archive/
 ieeestand1364-2005/
 tmp*/
+_audit_all_versions/
 vcd_analyzer_1_3_6.py
 vcd_analyzer_1_3_7.py
 vcd_analyzer_1_3_6_with_tests.zip
