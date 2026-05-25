@@ -49,11 +49,15 @@ Examples:
   vcd_analyzer search sim.vcd --changed data_out --condition "valid=0" --show data_out,valid
   vcd_analyzer search sim.vcd --condition "valid=x"
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
+
+Notes:
+  search requires at least one observed value_change in the VCD data section;
+  empty waveforms are reported as an input/data issue rather than as a false
+  "no match" result.
 """
 
-__version__ = '1.3.7'
+__version__ = '1.3.8'
 
-__author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
 import os
 import re
@@ -438,7 +442,14 @@ def _normalize_filter_patterns(value):
     """
     if value is None:
         return None
-    raw_patterns = value.split(',') if isinstance(value, str) else value
+    if isinstance(value, str):
+        raw_patterns = value.split(',')
+    elif isinstance(value, (list, tuple, set)):
+        raw_patterns = value
+    else:
+        raise _FilterParseError(
+            'filter patterns must be a string or a sequence of strings; got {}'.format(
+                type(value).__name__))
     out = []
     for raw in raw_patterns:
         pat = str(raw).strip()
@@ -1639,7 +1650,10 @@ def _search_end_time(vcd, t0, t1):
     if t1 is not None:
         return t1
     _mn, mx = vcd.scan_time_range()
-    return mx if mx is not None else t0
+    if mx is None:
+        raise _ConditionParseError(
+            'search cannot evaluate condition: VCD data section contains no value changes')
+    return mx
 
 
 def _event_groups(vcd, t0, t1, sids):
@@ -2007,6 +2021,8 @@ def cmd_compare(vcd, args):
         raise _TimeParseError(
             '--at needs two times separated by comma, e.g. --at 17.5us,17.7us')
     ta, tb = parse_time(parts[0].strip(), ts), parse_time(parts[1].strip(), ts)
+    if tb < ta:
+        raise _TimeParseError('second compare time must be >= first compare time')
     sids = vcd.match(args.filter)
     sa = _build_snapshot(vcd, ta, sids)
     sb = _build_snapshot(vcd, tb, sids)

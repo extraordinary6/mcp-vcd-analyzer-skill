@@ -13,7 +13,7 @@ FIX_HANDSHAKE = ROOT / "tests" / "fixtures" / "handshake_trace.vcd"
 FIX_BUS_RANGE = ROOT / "tests" / "fixtures" / "bus_range_trace.vcd"
 FIX_ESCAPED = ROOT / "tests" / "fixtures" / "escaped_trace.vcd"
 
-VERSION = "1.3.7"
+VERSION = "1.3.8"
 LEGACY_SEARCH = False
 SUPPORTS_EDGES = False
 SUPPORTS_HANDSHAKE = False
@@ -206,6 +206,42 @@ class TestCLI(unittest.TestCase):
         if SUPPORTS_SCOPE_FIX:
             info = run_json("--json", "info", FIX_ESCAPED)
             self.assertEqual(info["scopes"], ["tb"])
+
+
+    def test_filter_normalize_rejects_non_sequence(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("vcd_analyzer_testmod", str(SCRIPT))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with self.assertRaises(mod._FilterParseError):
+            mod._normalize_filter_patterns(123)
+
+    def test_compare_rejects_reversed_time_range(self):
+        result = run_cli("compare", FIX_BASIC, "--at", "30ns,10ns")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("second compare time must be >= first compare time", result.stderr)
+
+    def test_search_rejects_empty_data_section(self):
+        empty_vcd = """\
+$timescale 1ns $end
+$scope module tb $end
+$var wire 1 ! sig $end
+$upscope $end
+$enddefinitions $end
+"""
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".vcd", delete=False) as f:
+            f.write(empty_vcd)
+            tmp = f.name
+        try:
+            result = run_cli("search", tmp, "--condition", "sig=1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("contains no value changes", result.stderr)
+            result_json = run_cli("--json", "search", tmp, "--condition", "sig=1")
+            self.assertNotEqual(result_json.returncode, 0)
+            self.assertIn("contains no value changes", result_json.stderr)
+        finally:
+            os.unlink(tmp)
 
 
 if __name__ == "__main__":
