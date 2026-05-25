@@ -13,7 +13,7 @@ FIX_HANDSHAKE = ROOT / "tests" / "fixtures" / "handshake_trace.vcd"
 FIX_BUS_RANGE = ROOT / "tests" / "fixtures" / "bus_range_trace.vcd"
 FIX_ESCAPED = ROOT / "tests" / "fixtures" / "escaped_trace.vcd"
 
-VERSION = "1.3.8"
+VERSION = "1.3.9"
 LEGACY_SEARCH = False
 SUPPORTS_EDGES = False
 SUPPORTS_HANDSHAKE = False
@@ -242,6 +242,58 @@ $enddefinitions $end
             self.assertIn("contains no value changes", result_json.stderr)
         finally:
             os.unlink(tmp)
+
+
+    def _base_vcd(self, decls, data):
+        return "$timescale 1ns $end\n$scope module tb $end\n" + decls + "$upscope $end\n$enddefinitions $end\n" + data
+
+    def _tmp_vcd(self, body):
+        import tempfile, os
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".vcd", delete=False) as f:
+            f.write(body)
+            return f.name
+
+    def test_info_dump_agree_on_malformed_vector(self):
+        tmp = self._tmp_vcd(self._base_vcd('$var wire 1 ! a $end\n', 'b1010\n#10\n1!\n'))
+        try:
+            info = run_json("--json", "info", tmp)
+            dump = run_json("--json", "dump", tmp)
+            self.assertEqual(info["time_max_ticks"], 10)
+            self.assertEqual([e["time_ticks"] for e in dump["events"]], [10])
+        finally:
+            import os; os.unlink(tmp)
+
+    def test_info_dump_agree_on_malformed_real(self):
+        decls = '$var real 64 ! r $end\n$var wire 1 " a $end\n'
+        data = 'reset !\n#7\n1"\n'
+        tmp = self._tmp_vcd(self._base_vcd(decls, data))
+        try:
+            info = run_json("--json", "info", tmp)
+            dump = run_json("--json", "dump", tmp)
+            self.assertEqual(info["time_max_ticks"], 7)
+            self.assertEqual(dump["events"][0]["time_ticks"], 7)
+        finally:
+            import os; os.unlink(tmp)
+
+    def test_info_dump_agree_on_malformed_port(self):
+        tmp = self._tmp_vcd(self._base_vcd('$var wire 1 ! p $end\n', 'pH #10 1!\n#20\n0!\n'))
+        try:
+            info = run_json("--json", "info", tmp)
+            dump = run_json("--json", "dump", tmp)
+            self.assertEqual(info["time_max_ticks"], 20)
+            self.assertEqual([e["time_ticks"] for e in dump["events"]], [10, 20])
+        finally:
+            import os; os.unlink(tmp)
+
+    def test_valid_multichar_port_parses_both_info_and_dump(self):
+        tmp = self._tmp_vcd(self._base_vcd('$var wire 2 ! data $end\n', '#0\npHL 0 6 !\n'))
+        try:
+            info = run_json("--json", "info", tmp)
+            dump = run_json("--json", "dump", tmp)
+            self.assertEqual(info["time_min_ticks"], 0)
+            self.assertEqual(dump["events"][0]["value"], "2 (0x2)")
+        finally:
+            import os; os.unlink(tmp)
 
 
 if __name__ == "__main__":

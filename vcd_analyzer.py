@@ -56,7 +56,7 @@ Notes:
   "no match" result.
 """
 
-__version__ = '1.3.8'
+__version__ = '1.3.9'
 
 import sys
 import os
@@ -883,6 +883,98 @@ class VCDParser:
                 for t in line.split():
                     yield t
 
+    def _is_structural_token(self, tok):
+        """Return True when tok is structural rather than an identifier_code.
+
+        Only #<digits> has positional ambiguity: it can be a timestamp at
+        top level, or a legal identifier_code after b/r/p. If such a token is
+        declared as a normal signal or bit-exploded bit, it is the symbol;
+        otherwise it is structural and must be pushed back so the outer loop
+        can process it as a timestamp.
+        """
+        if tok is None:
+            return True
+        if tok.startswith('#') and len(tok) > 1 and tok[1].isdigit():
+            return tok not in self.signals and tok not in self._bit_map
+        return False
+
+    def _consume_value_change(self, tok, next_token, pushback):
+        """Parse one VCD value_change token sequence.
+
+        Returns (identifier_code, value_str) on a valid value_change, or None
+        when tok is malformed / not a value_change. This is the single shared
+        validation path used by iter_events() and scan_time_range(), so info's
+        reported time range stays aligned with dump/search parsing behavior.
+
+        next_token is a zero-arg function over the same pushback-capable token
+        stream as the caller. If a token consumed while validating b/r/p turns
+        out to be structural, it is pushed back in the same order used by the
+        old local parsers.
+        """
+        if not tok:
+            return None
+        first = tok[0]
+
+        if first in '01xXzZ':
+            sym = tok[1:]
+            if not sym:
+                return None
+            return sym, first.lower()
+
+        if first in 'bB':
+            bits = tok[1:]
+            if not bits or any(c not in '01xXzZ' for c in bits):
+                return None
+            sym = next_token()
+            if self._is_structural_token(sym):
+                if sym is not None:
+                    pushback.append(sym)
+                return None
+            return sym, bits.lower()
+
+        if first in 'rR':
+            body = tok[1:]
+            if len(body) > _REAL_MAX_LEN or not _REAL_RE.match(body):
+                return None
+            sym = next_token()
+            if self._is_structural_token(sym):
+                if sym is not None:
+                    pushback.append(sym)
+                return None
+            return sym, body
+
+        if first == 'p':
+            # Extended VCD (18.4.3.1): p<state> <s0> <s1> <id>.
+            # Keep this validation in one place so malformed port events are
+            # treated identically by iter_events() and scan_time_range().
+            state = tok[1:] if len(tok) > 1 else ''
+            if not state or any(c not in _PORT_STATE for c in state):
+                return None
+
+            s0 = next_token()
+            if s0 is None or len(s0) != 1 or s0 not in '01234567':
+                if s0 is not None:
+                    pushback.append(s0)
+                return None
+
+            s1 = next_token()
+            if s1 is None or len(s1) != 1 or s1 not in '01234567':
+                if s1 is not None:
+                    pushback.append(s1)
+                pushback.append(s0)
+                return None
+
+            sym = next_token()
+            if self._is_structural_token(sym):
+                if sym is not None:
+                    pushback.append(sym)
+                pushback.append(s1)
+                pushback.append(s0)
+                return None
+            return sym, ''.join(_PORT_STATE[c] for c in state)
+
+        return None
+
     def iter_events(self, t0=0, t1=None, sids=None):
         """Yield (time, sig_id, value_str) with bit reassembly.
 
@@ -943,21 +1035,6 @@ class VCDParser:
         def _next():
             return pushback.pop() if pushback else next(raw, None)
 
-        def _looks_structural(t):
-            """True only if t is a timestamp (#<digit>...) AND not a
-            declared identifier_code. Per IEEE 1364-2005 18.2.1,
-            identifier_code is any printable ASCII string, so '#1' can be
-            both a legal symbol and (in another position) a timestamp.
-            Disambiguate by checking the declared identifier table — if
-            the file declared a $var with this identifier, it IS the
-            symbol; otherwise treat as a stray timestamp from malformed
-            input and push it back."""
-            if t is None:
-                return True
-            if t.startswith('#') and len(t) > 1 and t[1].isdigit():
-                return t not in self.signals and t not in self._bit_map
-            return False
-
         try:
             while True:
                 tok = _next()
@@ -992,71 +1069,13 @@ class VCDParser:
                         return
                     continue
     
-                # Parse one value_change. May consume 1, 2, or 4 tokens.
-                # Each branch validates body shape AND that the consumed sym
-                # is not actually a structural token; malformed inputs are
-                # skipped without corrupting downstream parsing state.
-                first = tok[0]
-                if first in '01xXzZ':
-                    val = first.lower()
-                    sym = tok[1:]
-                    if not sym:
-                        continue
-                elif first in 'bB':
-                    bits = tok[1:]
-                    if not bits or any(c not in '01xXzZ' for c in bits):
-                        continue  # malformed body; do NOT consume next token
-                    sym = _next()
-                    if _looks_structural(sym):
-                        if sym is not None:
-                            pushback.append(sym)
-                        continue
-                    val = bits.lower()
-                elif first in 'rR':
-                    body = tok[1:]
-                    # Length cap defends against malicious VCDs that try to
-                    # exploit regex worst-case behavior with multi-KB tokens.
-                    # Legitimate %.16g output is ~25 chars max.
-                    if len(body) > _REAL_MAX_LEN or not _REAL_RE.match(body):
-                        continue  # 'reset', 'rXYZ' etc — not a real value
-                    sym = _next()
-                    if _looks_structural(sym):
-                        if sym is not None:
-                            pushback.append(sym)
-                        continue
-                    val = body
-                elif first == 'p':
-                    # Extended VCD (18.4.3.1): p<state> <s0> <s1> <id>
-                    # Strength components are single digits 0-7. Validate
-                    # before consuming further tokens so a malformed
-                    # 'pH #10 1!' doesn't swallow the #10 timestamp.
-                    state = tok[1:] if len(tok) > 1 else ''
-                    # Port state is one or more Extended VCD state characters.
-                    # Reject empty/unknown state strings instead of inventing an
-                    # x event from malformed input such as plain 'p 0 6 !'.
-                    if not state or any(c not in _PORT_STATE for c in state):
-                        continue
-                    _s0 = _next()
-                    if _s0 is None or len(_s0) != 1 or _s0 not in '01234567':
-                        if _s0 is not None:
-                            pushback.append(_s0)
-                        continue
-                    _s1 = _next()
-                    if _s1 is None or len(_s1) != 1 or _s1 not in '01234567':
-                        if _s1 is not None:
-                            pushback.append(_s1)
-                        pushback.append(_s0)
-                        continue
-                    sym = _next()
-                    if _looks_structural(sym):
-                        if sym is not None:
-                            pushback.append(sym)
-                        pushback.append(_s1)
-                        pushback.append(_s0)
-                        continue
-                    val = ''.join(_PORT_STATE[c] for c in state)
-                else:
-                    continue  # unparseable token
+                # Shared value_change parser. Keeping b/r/p validation in one
+                # helper prevents scan_time_range() and iter_events() from
+                # drifting apart when malformed-token rules are adjusted.
+                parsed = self._consume_value_change(tok, _next, pushback)
+                if parsed is None:
+                    continue
+                sym, val = parsed
     
                 # Catch-up before t0: update bit_state only, don't emit.
                 # Standalone state is owned by callers (e.g. _build_snapshot
@@ -1110,8 +1129,8 @@ class VCDParser:
         If any value_change occurs before the first #T (an initial $dumpvars
         block), t_min is 0. Time is observed-max (never less than the largest
         seen), so malformed VCDs with timestamps going backwards do not produce
-        negative duration. Value-change body validation mirrors iter_events()
-        closely enough that info/dump agree on malformed b/r/p bodies.
+        negative duration. Value-change body validation uses the same shared token consumer as
+        iter_events(), so info/dump agree on malformed b/r/p bodies.
 
         The underlying token generator owns an open file. Close it explicitly
         on all paths instead of relying on garbage collection if a resource
@@ -1124,14 +1143,6 @@ class VCDParser:
 
         def _next():
             return pushback.pop() if pushback else next(raw, None)
-
-        def _is_struct(t):
-            if t is None:
-                return True
-            if t.startswith('#') and len(t) > 1 and t[1].isdigit():
-                # Declared identifier_code with #-form is not a timestamp.
-                return t not in self.signals and t not in self._bit_map
-            return False
 
         try:
             while True:
@@ -1154,55 +1165,10 @@ class VCDParser:
                     t_max = t if t_max is None else max(t_max, t)
                     continue
 
-                # Value-change branches with body validation.
-                first = tok[0] if tok else ''
-                if first in '01xXzZ' and len(tok) > 1:
-                    if t_min is None:
-                        saw_initial_data = True
-                elif first in 'bB':
-                    bits = tok[1:]
-                    if not bits or any(c not in '01xXzZ' for c in bits):
-                        continue
-                    sym = _next()
-                    if _is_struct(sym):
-                        if sym is not None:
-                            pushback.append(sym)
-                        continue
-                    if t_min is None:
-                        saw_initial_data = True
-                elif first in 'rR':
-                    body = tok[1:]
-                    if len(body) > _REAL_MAX_LEN or not _REAL_RE.match(body):
-                        continue
-                    sym = _next()
-                    if _is_struct(sym):
-                        if sym is not None:
-                            pushback.append(sym)
-                        continue
-                    if t_min is None:
-                        saw_initial_data = True
-                elif first == 'p':
-                    state = tok[1:] if len(tok) > 1 else ''
-                    if not state or any(c not in _PORT_STATE for c in state):
-                        continue
-                    _s0 = _next()
-                    if _s0 is None or len(_s0) != 1 or _s0 not in '01234567':
-                        if _s0 is not None:
-                            pushback.append(_s0)
-                        continue
-                    _s1 = _next()
-                    if _s1 is None or len(_s1) != 1 or _s1 not in '01234567':
-                        if _s1 is not None:
-                            pushback.append(_s1)
-                        pushback.append(_s0)
-                        continue
-                    sym = _next()
-                    if _is_struct(sym):
-                        if sym is not None:
-                            pushback.append(sym)
-                        pushback.append(_s1)
-                        pushback.append(_s0)
-                        continue
+                # Shared value_change validation. We do not need the
+                # parsed sym/value here; the goal is only to know whether a
+                # legitimate value_change appears before the first timestamp.
+                if self._consume_value_change(tok, _next, pushback) is not None:
                     if t_min is None:
                         saw_initial_data = True
         finally:
