@@ -2230,6 +2230,649 @@ def cmd_search(vcd, args):
         print('No {} in {}..{} where {}.'.format(
             noun, fmt_time(t0, ts), fmt_time(t1, ts), cond_text))
 
+
+# -- Protocol Decoders -------------------------------------------------------
+
+class ProtocolDecoder:
+    """Base class for protocol decoders"""
+    def __init__(self, vcd, signal_pattern):
+        self.vcd = vcd
+        self.ts_sec = vcd.ts_sec
+        self.signal_map = self._identify_signals(signal_pattern)
+
+    def _identify_signals(self, pattern):
+        """Identify and map protocol signals. Override in subclass."""
+        raise NotImplementedError
+
+    def decode(self, t0, t1):
+        """Decode protocol transactions. Returns (transactions, violations, statistics)."""
+        raise NotImplementedError
+
+
+class AXI4Decoder(ProtocolDecoder):
+    """AXI4 protocol decoder"""
+
+    def _identify_signals(self, pattern):
+        """Identify AXI4 signals from pattern"""
+        matched_sids = self.vcd.match(pattern)
+        if not matched_sids:
+            raise ValueError(f"No signals matched pattern: {pattern}")
+
+        signal_map = {}
+        for sid in matched_sids:
+            path = self.vcd.signals[sid]['path']
+            # Extract signal name (last part after dot, or full path if no dot)
+            signal_name = path.split('.')[-1].lower()
+
+            # Write Address Channel
+            if 'awvalid' in signal_name:
+                signal_map['awvalid'] = sid
+            elif 'awready' in signal_name:
+                signal_map['awready'] = sid
+            elif 'awaddr' in signal_name:
+                signal_map['awaddr'] = sid
+            elif 'awlen' in signal_name:
+                signal_map['awlen'] = sid
+            elif 'awsize' in signal_name:
+                signal_map['awsize'] = sid
+            elif 'awburst' in signal_name:
+                signal_map['awburst'] = sid
+
+            # Write Data Channel
+            elif 'wvalid' in signal_name:
+                signal_map['wvalid'] = sid
+            elif 'wready' in signal_name:
+                signal_map['wready'] = sid
+            elif 'wdata' in signal_name:
+                signal_map['wdata'] = sid
+            elif 'wlast' in signal_name:
+                signal_map['wlast'] = sid
+            elif 'wstrb' in signal_name:
+                signal_map['wstrb'] = sid
+
+            # Write Response Channel
+            elif 'bvalid' in signal_name:
+                signal_map['bvalid'] = sid
+            elif 'bready' in signal_name:
+                signal_map['bready'] = sid
+            elif 'bresp' in signal_name:
+                signal_map['bresp'] = sid
+
+            # Read Address Channel
+            elif 'arvalid' in signal_name:
+                signal_map['arvalid'] = sid
+            elif 'arready' in signal_name:
+                signal_map['arready'] = sid
+            elif 'araddr' in signal_name:
+                signal_map['araddr'] = sid
+            elif 'arlen' in signal_name:
+                signal_map['arlen'] = sid
+
+            # Read Data Channel
+            elif 'rvalid' in signal_name:
+                signal_map['rvalid'] = sid
+            elif 'rready' in signal_name:
+                signal_map['rready'] = sid
+            elif 'rdata' in signal_name:
+                signal_map['rdata'] = sid
+            elif 'rresp' in signal_name:
+                signal_map['rresp'] = sid
+            elif 'rlast' in signal_name:
+                signal_map['rlast'] = sid
+
+        return signal_map
+
+    def decode(self, t0, t1):
+        """Decode AXI4 transactions in time range [t0, t1]"""
+        transactions = []
+        violations = []
+
+        # Track state for each channel
+        write_txns = []  # List of write transactions
+        read_txns = []   # List of read transactions
+        txn_id_counter = 0
+
+        # Current signal values
+        current_vals = {}
+        for name, sid in self.signal_map.items():
+            current_vals[name] = None
+
+        # Track previous handshake states to avoid duplicate captures
+        prev_aw_handshake = False
+        prev_w_handshake = False
+        prev_ar_handshake = False
+        prev_r_handshake = False
+
+        # Collect all events
+        all_sids = list(self.signal_map.values())
+        for t, sid, val in self.vcd.iter_events(t0, t1, all_sids):
+            # Find signal name
+            sig_name = None
+            for name, s in self.signal_map.items():
+                if s == sid:
+                    sig_name = name
+                    break
+
+            if sig_name:
+                current_vals[sig_name] = val
+
+            # Check for write address handshake (check after every event)
+            aw_handshake = (current_vals.get('awvalid') == '1' and
+                           current_vals.get('awready') == '1')
+
+            if aw_handshake and not prev_aw_handshake:
+                # Write address accepted
+                addr_val = current_vals.get('awaddr', '0')
+                addr = val_to_int(addr_val) if addr_val else 0
+                awlen_val = current_vals.get('awlen', '0')
+                burst_len = val_to_int(awlen_val) + 1 if awlen_val else 1
+
+                txn = {
+                    'id': txn_id_counter,
+                    'type': 'write',
+                    'addr': addr,
+                    'addr_time': t,
+                    'burst_len': burst_len,
+                    'data': [],
+                    'status': 'pending'
+                }
+                write_txns.append(txn)
+                txn_id_counter += 1
+
+            prev_aw_handshake = aw_handshake
+
+            # Check for write data handshake (check after every event)
+            w_handshake = (current_vals.get('wvalid') == '1' and
+                          current_vals.get('wready') == '1')
+
+            # Record data on new handshake OR when wdata changes during active handshake
+            if w_handshake:
+                if not prev_w_handshake or sig_name == 'wdata':
+                    # New handshake OR wdata changed during handshake - record data
+                    wdata_val = current_vals.get('wdata', '0')
+                    data = val_to_int(wdata_val) if wdata_val else 0
+                    wlast = current_vals.get('wlast') == '1'
+
+                    # Find matching transaction (most recent pending)
+                    for txn in reversed(write_txns):
+                        if txn['status'] == 'pending':
+                            txn['data'].append(data)
+                            if wlast:
+                                txn['data_time'] = t
+                            break
+
+            prev_w_handshake = w_handshake
+
+            # Check for write response handshake (check after every event)
+            b_handshake = (current_vals.get('bvalid') == '1' and
+                          current_vals.get('bready') == '1')
+
+            if b_handshake:
+                # Write response received
+                bresp_val = current_vals.get('bresp', '0')
+                bresp = val_to_int(bresp_val) if bresp_val else 0
+
+                # Find matching transaction
+                for txn in reversed(write_txns):
+                    if txn['status'] == 'pending' and 'data_time' in txn:
+                        txn['end_time'] = t
+                        txn['status'] = ['OKAY', 'EXOKAY', 'SLVERR', 'DECERR'][bresp] if bresp < 4 else 'UNKNOWN'
+                        transactions.append(txn)
+                        break
+
+            # Check for read address handshake (check after every event)
+            ar_handshake = (current_vals.get('arvalid') == '1' and
+                           current_vals.get('arready') == '1')
+
+            if ar_handshake and not prev_ar_handshake:
+                # Read address accepted
+                addr_val = current_vals.get('araddr', '0')
+                addr = val_to_int(addr_val) if addr_val else 0
+                arlen_val = current_vals.get('arlen', '0')
+                burst_len = val_to_int(arlen_val) + 1 if arlen_val else 1
+
+                txn = {
+                    'id': txn_id_counter,
+                    'type': 'read',
+                    'addr': addr,
+                    'addr_time': t,
+                    'burst_len': burst_len,
+                    'data': [],
+                    'status': 'pending'
+                }
+                read_txns.append(txn)
+                txn_id_counter += 1
+
+            prev_ar_handshake = ar_handshake
+
+            # Check for read data handshake (check after every event)
+            r_handshake = (current_vals.get('rvalid') == '1' and
+                          current_vals.get('rready') == '1')
+
+            # Record data on new handshake OR when rdata changes during active handshake
+            if r_handshake:
+                if not prev_r_handshake or sig_name == 'rdata':
+                    # New handshake OR rdata changed during handshake - record data
+                    rdata_val = current_vals.get('rdata', '0')
+                    data = val_to_int(rdata_val) if rdata_val else 0
+                    rlast = current_vals.get('rlast') == '1'
+                    rresp_val = current_vals.get('rresp', '0')
+                    rresp = val_to_int(rresp_val) if rresp_val else 0
+
+                    # Find matching transaction
+                    for txn in reversed(read_txns):
+                        if txn['status'] == 'pending':
+                            txn['data'].append(data)
+                            if rlast:
+                                txn['end_time'] = t
+                                txn['status'] = ['OKAY', 'EXOKAY', 'SLVERR', 'DECERR'][rresp] if rresp < 4 else 'UNKNOWN'
+                                transactions.append(txn)
+                            break
+
+            prev_r_handshake = r_handshake
+
+        # Detect protocol violations
+        violations = self._detect_violations(transactions, t0, t1)
+
+        # Calculate statistics
+        statistics = self._compute_statistics(transactions, t0, t1)
+
+        return transactions, violations, statistics
+
+
+    def _detect_violations(self, transactions, t0, t1):
+        """Detect AXI4 protocol violations"""
+        violations = []
+
+        # Check for incomplete transactions
+        for txn in transactions:
+            if txn['status'] == 'pending':
+                violations.append({
+                    'type': 'incomplete_transaction',
+                    'time': fmt_time(txn['addr_time'], self.ts_sec),
+                    'time_ticks': txn['addr_time'],
+                    'severity': 'warning',
+                    'description': f"{txn['type'].capitalize()} transaction to 0x{txn['addr']:X} not completed"
+                })
+
+            # Check burst length mismatch
+            if 'data' in txn and len(txn['data']) != txn['burst_len']:
+                violations.append({
+                    'type': 'burst_length_mismatch',
+                    'time': fmt_time(txn.get('end_time', txn['addr_time']), self.ts_sec),
+                    'time_ticks': txn.get('end_time', txn['addr_time']),
+                    'severity': 'error',
+                    'description': f"Expected {txn['burst_len']} beats, got {len(txn['data'])}"
+                })
+
+        return violations
+
+    def _compute_statistics(self, transactions, t0, t1):
+        """Compute performance statistics"""
+        if not transactions:
+            return {
+                'total_transactions': 0,
+                'read_count': 0,
+                'write_count': 0,
+                'avg_latency': None,
+                'bandwidth_utilization': 0.0
+            }
+
+        read_txns = [t for t in transactions if t['type'] == 'read']
+        write_txns = [t for t in transactions if t['type'] == 'write']
+
+        # Calculate average latency
+        latencies = []
+        for txn in transactions:
+            if 'end_time' in txn and 'addr_time' in txn:
+                latency = txn['end_time'] - txn['addr_time']
+                latencies.append(latency)
+
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0
+
+        # Calculate bandwidth utilization (simplified)
+        total_time = t1 - t0 if t1 else 0
+        active_time = sum(latencies)
+        bandwidth_util = (active_time / total_time) if total_time > 0 else 0.0
+
+        return {
+            'total_transactions': len(transactions),
+            'read_count': len(read_txns),
+            'write_count': len(write_txns),
+            'avg_latency': fmt_time(int(avg_latency), self.ts_sec) if avg_latency > 0 else None,
+            'avg_latency_ticks': int(avg_latency) if avg_latency > 0 else None,
+            'bandwidth_utilization': round(bandwidth_util, 2)
+        }
+
+
+def cmd_protocol_decode(vcd, args):
+    """Protocol decode command handler"""
+    ts = vcd.ts_sec
+    t0 = parse_time(args.begin, ts) if args.begin else 0
+    t1 = parse_time(args.end, ts) if args.end else None
+
+    protocol = args.protocol.lower()
+
+    # Normalize signal pattern
+    if args.signals:
+        signals = _normalize_filter_patterns(args.signals)
+    else:
+        signals = None
+
+    # Create decoder
+    if protocol == 'axi4':
+        decoder = AXI4Decoder(vcd, signals)
+    else:
+        raise ValueError(f"Unsupported protocol: {protocol}")
+
+    # Decode
+    transactions, violations, statistics = decoder.decode(t0, t1)
+
+    # Format transactions for output
+    formatted_txns = []
+    for i, txn in enumerate(transactions):
+        formatted = {
+            'id': i,
+            'type': txn['type'],
+            'start_time': fmt_time(txn['addr_time'], ts),
+            'start_time_ticks': txn['addr_time'],
+            'addr': f"0x{txn['addr']:X}",
+            'burst_len': txn['burst_len'],
+            'status': txn['status']
+        }
+        if 'end_time' in txn:
+            formatted['end_time'] = fmt_time(txn['end_time'], ts)
+            formatted['end_time_ticks'] = txn['end_time']
+        if txn['data']:
+            formatted['data'] = [f"0x{d:X}" for d in txn['data']]
+        formatted_txns.append(formatted)
+
+    # Generate suggestions
+    suggestions = []
+    if violations:
+        suggestions.append(f"Found {len(violations)} protocol violation(s)")
+    if statistics['bandwidth_utilization'] < 0.5:
+        suggestions.append(f"Low bandwidth utilization ({statistics['bandwidth_utilization']*100:.0f}%), check for stalls")
+    if not transactions:
+        suggestions.append("No transactions found in specified time range")
+
+    # Output
+    result = {
+        'status': 'success',
+        'skill': 'protocol_decode',
+        'input': {
+            'file': vcd.path,
+            'protocol': protocol,
+            'signals': signals,
+            'time_range': [fmt_time(t0, ts), fmt_time(t1, ts) if t1 else 'end']
+        },
+        'result': {
+            'transactions': formatted_txns,
+            'violations': violations,
+            'statistics': statistics
+        },
+        'suggestions': suggestions
+    }
+
+    if args.json:
+        _json(result)
+    else:
+        # Text output
+        print(f"Protocol: {protocol.upper()}")
+        print(f"Time range: {result['input']['time_range'][0]} ~ {result['input']['time_range'][1]}")
+        print(f"\nTransactions: {statistics['total_transactions']}")
+        print(f"  Reads:  {statistics['read_count']}")
+        print(f"  Writes: {statistics['write_count']}")
+
+        if formatted_txns:
+            print("\nTransaction Details:")
+            for txn in formatted_txns:
+                end_str = f" -> {txn['end_time']}" if 'end_time' in txn else " (pending)"
+                print(f"  [{txn['id']}] {txn['type'].upper()}: {txn['addr']} @ {txn['start_time']}{end_str} [{txn['status']}]")
+                if 'data' in txn:
+                    print(f"      Data: {', '.join(txn['data'])}")
+
+        if violations:
+            print(f"\nViolations: {len(violations)}")
+            for v in violations:
+                print(f"  [{v['severity'].upper()}] {v['time']}: {v['description']}")
+
+        print(f"\nStatistics:")
+        print(f"  Avg Latency: {statistics['avg_latency'] or 'N/A'}")
+        print(f"  Bandwidth Utilization: {statistics['bandwidth_utilization']*100:.1f}%")
+
+        if suggestions:
+            print(f"\nSuggestions:")
+            for s in suggestions:
+                print(f"  - {s}")
+
+
+# -- FSM Trace ---------------------------------------------------------------
+
+class FSMTracer:
+    """State machine tracer"""
+
+    def __init__(self, vcd, state_signal):
+        self.vcd = vcd
+        self.ts_sec = vcd.ts_sec
+
+        # Find state signal
+        matched = vcd.match([state_signal])
+        if not matched:
+            raise ValueError(f"State signal not found: {state_signal}")
+        if len(matched) > 1:
+            raise ValueError(f"State signal pattern matched multiple signals: {state_signal}")
+
+        self.state_sid = list(matched)[0]
+        self.state_path = vcd.signals[self.state_sid]['path']
+
+    def trace(self, t0, t1, stuck_threshold=100000):  # 100us default
+        """Extract state transitions and detect anomalies"""
+        transitions = []
+        states_seen = {}  # value -> count
+
+        current_state = None
+        state_start_time = None
+        prev_time = t0
+
+        # Collect state transitions
+        for t, sid, val in self.vcd.iter_events(t0, t1, [self.state_sid]):
+            if current_state is not None:
+                duration = t - state_start_time
+                transitions.append({
+                    'from': current_state,
+                    'to': val,
+                    'time': t,
+                    'time_ticks': t,
+                    'duration_in_from': duration,
+                    'duration_in_from_ticks': duration
+                })
+
+                # Track state occurrences
+                if current_state not in states_seen:
+                    states_seen[current_state] = 0
+                states_seen[current_state] += 1
+
+            current_state = val
+            state_start_time = t
+            prev_time = t
+
+        # Handle final state
+        if current_state is not None and t1:
+            final_duration = t1 - state_start_time
+            if current_state not in states_seen:
+                states_seen[current_state] = 0
+            states_seen[current_state] += 1
+
+        # Detect anomalies
+        anomalies = self._detect_anomalies(transitions, stuck_threshold)
+
+        # Compute statistics
+        statistics = self._compute_statistics(transitions, states_seen, t0, t1)
+
+        return transitions, anomalies, statistics
+
+    def _detect_anomalies(self, transitions, stuck_threshold):
+        """Detect FSM anomalies"""
+        anomalies = []
+
+        for trans in transitions:
+            duration = trans['duration_in_from']
+
+            # Stuck state: duration exceeds threshold
+            if duration > stuck_threshold:
+                anomalies.append({
+                    'type': 'stuck_state',
+                    'state': trans['from'],
+                    'time': fmt_time(trans['time'] - duration, self.ts_sec),
+                    'time_ticks': trans['time'] - duration,
+                    'duration': fmt_time(duration, self.ts_sec),
+                    'duration_ticks': duration,
+                    'severity': 'warning',
+                    'description': f"State {trans['from']} held for {fmt_time(duration, self.ts_sec)} (threshold: {fmt_time(stuck_threshold, self.ts_sec)})"
+                })
+
+        return anomalies
+
+    def _compute_statistics(self, transitions, states_seen, t0, t1):
+        """Compute FSM statistics"""
+        if not transitions:
+            return {
+                'total_transitions': 0,
+                'unique_states': len(states_seen),
+                'states': []
+            }
+
+        # Calculate time spent in each state
+        state_durations = {}
+        for trans in transitions:
+            state = trans['from']
+            duration = trans['duration_in_from']
+
+            if state not in state_durations:
+                state_durations[state] = []
+            state_durations[state].append(duration)
+
+        # Format state statistics
+        state_stats = []
+        for state, durations in state_durations.items():
+            total_time = sum(durations)
+            avg_time = total_time / len(durations)
+            min_time = min(durations)
+            max_time = max(durations)
+
+            state_stats.append({
+                'state': state,
+                'occurrences': len(durations),
+                'total_time': fmt_time(total_time, self.ts_sec),
+                'total_time_ticks': total_time,
+                'avg_time': fmt_time(int(avg_time), self.ts_sec),
+                'avg_time_ticks': int(avg_time),
+                'min_time': fmt_time(min_time, self.ts_sec),
+                'min_time_ticks': min_time,
+                'max_time': fmt_time(max_time, self.ts_sec),
+                'max_time_ticks': max_time
+            })
+
+        # Sort by total time (descending)
+        state_stats.sort(key=lambda x: x['total_time_ticks'], reverse=True)
+
+        return {
+            'total_transitions': len(transitions),
+            'unique_states': len(states_seen),
+            'states': state_stats
+        }
+
+
+def cmd_fsm_trace(vcd, args):
+    """FSM trace command handler"""
+    ts = vcd.ts_sec
+    t0 = parse_time(args.begin, ts) if args.begin else 0
+    t1 = parse_time(args.end, ts) if args.end else None
+
+    state_signal = args.state
+    stuck_threshold = parse_time(args.stuck_threshold, ts) if args.stuck_threshold else 100000  # 100us
+
+    # Create tracer
+    tracer = FSMTracer(vcd, state_signal)
+
+    # Trace
+    transitions, anomalies, statistics = tracer.trace(t0, t1, stuck_threshold)
+
+    # Format transitions for output
+    formatted_trans = []
+    for i, trans in enumerate(transitions):
+        formatted = {
+            'id': i,
+            'from': trans['from'],
+            'to': trans['to'],
+            'time': trans['time'],
+            'time_ticks': trans['time_ticks'],
+            'duration_in_from': fmt_time(trans['duration_in_from'], ts),
+            'duration_in_from_ticks': trans['duration_in_from_ticks']
+        }
+        formatted_trans.append(formatted)
+
+    # Generate suggestions
+    suggestions = []
+    if anomalies:
+        suggestions.append(f"Found {len(anomalies)} anomaly(ies)")
+        for anom in anomalies[:3]:  # Show first 3
+            suggestions.append(f"State {anom['state']} stuck for {anom['duration']}")
+
+    if statistics['total_transitions'] == 0:
+        suggestions.append("No state transitions found in specified time range")
+
+    # Output
+    result = {
+        'status': 'success',
+        'skill': 'fsm_trace',
+        'input': {
+            'file': vcd.path,
+            'state_signal': state_signal,
+            'time_range': [fmt_time(t0, ts), fmt_time(t1, ts) if t1 else 'end'],
+            'stuck_threshold': fmt_time(stuck_threshold, ts)
+        },
+        'result': {
+            'transitions': formatted_trans,
+            'anomalies': anomalies,
+            'statistics': statistics
+        },
+        'suggestions': suggestions
+    }
+
+    if args.json:
+        _json(result)
+    else:
+        # Text output
+        print(f"State Signal: {tracer.state_path}")
+        print(f"Time range: {result['input']['time_range'][0]} ~ {result['input']['time_range'][1]}")
+        print(f"\nTransitions: {statistics['total_transitions']}")
+        print(f"Unique States: {statistics['unique_states']}")
+
+        if statistics['states']:
+            print("\nState Statistics:")
+            for st in statistics['states']:
+                print(f"  {st['state']}: {st['occurrences']} times, avg {st['avg_time']}, total {st['total_time']}")
+
+        if formatted_trans and not args.json:
+            print(f"\nTransition Details (showing first 20):")
+            for trans in formatted_trans[:20]:
+                print(f"  [{trans['id']}] {trans['from']} -> {trans['to']} @ {trans['time']} (held {trans['duration_in_from']})")
+            if len(formatted_trans) > 20:
+                print(f"  ... and {len(formatted_trans) - 20} more")
+
+        if anomalies:
+            print(f"\nAnomalies: {len(anomalies)}")
+            for anom in anomalies:
+                print(f"  [{anom['severity'].upper()}] {anom['time']}: {anom['description']}")
+
+        if suggestions:
+            print(f"\nSuggestions:")
+            for s in suggestions:
+                print(f"  - {s}")
+
+
 # -- CLI entry ---------------------------------------------------------------
 
 def _add_time_args(sp):
@@ -2301,6 +2944,22 @@ def main():
     sp.add_argument('--changed', metavar='PATTERN',
                     help='emit events only when this signal really changes; VCD event vars count each trigger; must match exactly one signal')
 
+    sp = sub.add_parser('protocol-decode', help='decode bus protocol transactions (AXI4/APB/UART/SPI)')
+    sp.add_argument('file', metavar='<file>')
+    sp.add_argument('--protocol', metavar='TYPE', required=True,
+                    help='protocol type: axi4, apb, uart, spi')
+    sp.add_argument('--signals', metavar='PATTERN',
+                    help='signal pattern to match (e.g., m_axi_*, s_apb_*); default: *')
+    _add_time_args(sp); _add_common(sp)
+
+    sp = sub.add_parser('fsm-trace', help='trace state machine transitions and detect anomalies')
+    sp.add_argument('file', metavar='<file>')
+    sp.add_argument('--state', metavar='SIGNAL', required=True,
+                    help='state signal name or pattern (e.g., state, fsm_state[2:0])')
+    sp.add_argument('--stuck-threshold', metavar='TIME',
+                    help='threshold for stuck state detection (e.g., 100us); default: 100us')
+    _add_time_args(sp); _add_common(sp)
+
     args = p.parse_args()
     if not args.cmd:
         p.print_help()
@@ -2309,7 +2968,8 @@ def main():
     try:
         vcd = VCDParser(args.file)
         cmds = {'info': cmd_info, 'list': cmd_list, 'dump': cmd_dump, 'summary': cmd_summary,
-                'snapshot': cmd_snapshot, 'compare': cmd_compare, 'search': cmd_search}
+                'snapshot': cmd_snapshot, 'compare': cmd_compare, 'search': cmd_search,
+                'protocol-decode': cmd_protocol_decode, 'fsm-trace': cmd_fsm_trace}
         cmds[args.cmd](vcd, args)
     except FileNotFoundError as e:
         sys.exit('Error: cannot open VCD file: {}'.format(e.filename or args.file))
