@@ -45,7 +45,7 @@ Examples:
   vcd_analyzer --json summary sim.vcd --filter tvalid,tready
 """
 
-__version__ = '1.3.1'
+__version__ = '1.3.2'
 
 __author__ = 'neveltyc <neveltyc@gmail.com>'
 import sys
@@ -1140,13 +1140,14 @@ def _trunc_line(shown, total, noun):
     return '... truncated: {}/{} {} shown.'.format(shown, total, noun)
 
 
-def _trunc_line_lower_bound(shown, noun):
+def _trunc_line_lower_bound(shown, total, noun):
     """Truncation line when scanning stopped at the first unshown result.
 
     Used by streaming commands where --limit is an execution bound, not just
-    an output bound. We intentionally avoid claiming an exact total.
+    an output bound. `total` is a lower bound (normally shown + 1),
+    not the exact global result count.
     """
-    return '... truncated: {}/{}+ {} shown.'.format(shown, shown, noun)
+    return '... truncated: {}/{}+ {} shown.'.format(shown, total, noun)
 
 
 def _total_json_fields(total, truncated):
@@ -1161,7 +1162,7 @@ def _total_json_fields(total, truncated):
 
 def _count_label(shown, total, truncated):
     """Human count label for result headers."""
-    return '{}+'.format(shown) if truncated else str(total)
+    return '{}+'.format(total) if truncated else str(total)
 
 
 def _selected_sids(vcd, sids):
@@ -1179,9 +1180,24 @@ def _time_pair(prefix, t, ts):
 
 
 def _build_snapshot(vcd, t_at, sids=None):
-    """Replay from start to t_at, return known {sig_id: value} only."""
+    """Replay from start through t_at, return known {sig_id: value} only."""
     state = {}
     for _t, sid, val in vcd.iter_events(0, t_at, sids):
+        state[sid] = val
+    return state
+
+
+def _build_snapshot_before(vcd, t_at, sids=None):
+    """Replay from start up to, but excluding, t_at.
+
+    Used by search --changed.  A value_change exactly at --begin must remain
+    observable as a transition, while t=0 dumpvars-style initialization is
+    still not treated as a real change by the changed-mode loop.
+    """
+    state = {}
+    for _t, sid, val in vcd.iter_events(0, t_at, sids):
+        if _t >= t_at:
+            break
         state[sid] = val
     return state
 
@@ -1749,7 +1765,7 @@ def cmd_dump(vcd, args):
         else:
             print('  {:<55} = {}'.format(e['path'], e['value']))
     if truncated:
-        print(_trunc_line_lower_bound(len(events), 'events'))
+        print(_trunc_line_lower_bound(len(events), total, 'events'))
 
 
 def cmd_summary(vcd, args):
@@ -1918,7 +1934,11 @@ def cmd_search(vcd, args):
     if changed_sid is not None:
         selected.add(changed_sid)
 
-    state = _build_snapshot(vcd, t0, selected)
+    # Inclusive snapshot is correct for interval/segment modes: they ask
+    # what state holds at t0.  changed mode needs the state before t0 so
+    # an edge exactly at --begin remains observable.
+    state = (_build_snapshot_before(vcd, t0, selected)
+             if changed_sid is not None else _build_snapshot(vcd, t0, selected))
     limit = _limit(args, 'search')
     verbose = getattr(args, 'verbose', False)
     cond_label = _condition_label(conditions)
@@ -1931,7 +1951,8 @@ def cmd_search(vcd, args):
         for t, group in _event_groups(vcd, t0, t1, selected):
             changed = set()
             for sid, val in group:
-                if state.get(sid) != val:
+                old_val = state.get(sid)
+                if not (t == 0 and old_val is None) and old_val != val:
                     changed.add(sid)
                 state[sid] = val
             if changed_sid not in changed:
@@ -1964,7 +1985,7 @@ def cmd_search(vcd, args):
             for e in events:
                 print('  T={:<12} {}'.format(e['time_h'], _values_text(e['values'])))
             if truncated:
-                print(_trunc_line_lower_bound(len(events), 'events'))
+                print(_trunc_line_lower_bound(len(events), total, 'events'))
         else:
             print('No event in {}..{} where {} changed and {}.'.format(
                 fmt_time(t0, ts), fmt_time(t1, ts), vcd.signals[changed_sid]['path'], cond_text))
@@ -2079,7 +2100,7 @@ def cmd_search(vcd, args):
             else:
                 print('  {:<12}..{:<12} {}'.format(r['begin_h'], r['end_h'], cond_text))
         if truncated:
-            print(_trunc_line_lower_bound(len(results), noun + 's'))
+            print(_trunc_line_lower_bound(len(results), total, noun + 's'))
     else:
         print('No {} in {}..{} where {}.'.format(
             noun, fmt_time(t0, ts), fmt_time(t1, ts), cond_text))

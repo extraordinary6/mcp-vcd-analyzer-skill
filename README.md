@@ -1,6 +1,6 @@
         # VCD Analyzer
 
-        Version `1.3.1`
+        Version `1.3.2`
 
         Author: `neveltyc <neveltyc@gmail.com>`
 
@@ -10,9 +10,9 @@
 
         ## Highlights
 
-        - Add lower-bound counting helpers for truncated dump and search results.
-- Improve JSON and text reporting when scans stop after the first hidden record.
-- Keep the sanitized condition-search tests aligned with the new result metadata.
+        - Add a pre-begin snapshot helper so changed-mode queries can see edges at the window boundary.
+- Keep the condition/show workflow intact while tightening event semantics.
+- Update the search fixtures and tests around changed-mode behavior.
 
         ## Commands
 
