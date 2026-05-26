@@ -1,0 +1,144 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "vcd_protocol_decode",
+      "description": "Decode bus protocol transactions (AXI4 / APB / UART / SPI). Returns transactions, protocol violations, and performance statistics.\n\nReturns the standardized VCD Analyzer envelope: {status, skill, execution_time_ms, input, result, metadata, suggestions}. On error, the envelope has status=\"error\" and error={code, message, details}.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Path to VCD file"
+          },
+          "protocol": {
+            "type": "string",
+            "enum": [
+              "axi4",
+              "apb",
+              "uart",
+              "spi"
+            ]
+          },
+          "signals": {
+            "type": "string",
+            "description": "Comma-separated signal patterns (substring or glob)"
+          },
+          "begin": {
+            "type": "string",
+            "description": "Start time (e.g. 100ns, 17.5us)"
+          },
+          "end": {
+            "type": "string",
+            "description": "End time (same format as begin)"
+          }
+        },
+        "required": [
+          "file",
+          "protocol"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "vcd_fsm_trace",
+      "description": "Extract state machine transitions from a state signal. Detects stuck states and provides per-state duration statistics.\n\nReturns the standardized VCD Analyzer envelope: {status, skill, execution_time_ms, input, result, metadata, suggestions}. On error, the envelope has status=\"error\" and error={code, message, details}.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "Signal pattern that must resolve to exactly one signal"
+          },
+          "stuck_threshold": {
+            "type": "string",
+            "description": "Duration above which a state is reported stuck (default 100us)"
+          },
+          "begin": {
+            "type": "string"
+          },
+          "end": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "state"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "vcd_causality",
+      "description": "Find potential causes for a signal change at a specific time. Ranks candidates by temporal proximity (40%) and historical correlation (60%); automatically filters clock-like signals.\n\nReturns the standardized VCD Analyzer envelope: {status, skill, execution_time_ms, input, result, metadata, suggestions}. On error, the envelope has status=\"error\" and error={code, message, details}.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "effect": {
+            "type": "string",
+            "description": "Effect signal pattern (must resolve to exactly one signal)"
+          },
+          "at": {
+            "type": "string",
+            "description": "Time when the effect was observed"
+          },
+          "window": {
+            "type": "string",
+            "description": "Search window before --at (default 100ns)"
+          }
+        },
+        "required": [
+          "file",
+          "effect",
+          "at"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "vcd_anomaly_detect",
+      "description": "Detect common waveform anomalies: stuck signals, glitches, metastability, bus contention. Severity-classified output suitable for triage.\n\nReturns the standardized VCD Analyzer envelope: {status, skill, execution_time_ms, input, result, metadata, suggestions}. On error, the envelope has status=\"error\" and error={code, message, details}.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string"
+          },
+          "filter": {
+            "type": "string",
+            "description": "Restrict analysis to matching signals"
+          },
+          "begin": {
+            "type": "string"
+          },
+          "end": {
+            "type": "string"
+          },
+          "stuck_threshold": {
+            "type": "string",
+            "description": "Default: 50% of window or 100us"
+          },
+          "glitch_threshold": {
+            "type": "string",
+            "description": "Default: 5ns"
+          }
+        },
+        "required": [
+          "file"
+        ]
+      }
+    }
+  }
+]
