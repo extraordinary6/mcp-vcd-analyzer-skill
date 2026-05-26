@@ -12,6 +12,12 @@ _rebuild_history.py
 _generate_version_notes.py
 publish_releases.ps1
 
+# Claude Code session files
+.claude/
+
+# Verilog simulation artifacts
+*.vvp
+
 
 # coverage artifacts
 htmlcov/

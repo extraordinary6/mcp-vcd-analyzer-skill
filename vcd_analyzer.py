@@ -2545,6 +2545,500 @@ class AXI4Decoder(ProtocolDecoder):
         }
 
 
+class APBDecoder(ProtocolDecoder):
+    """APB (Advanced Peripheral Bus) protocol decoder.
+
+    Supports APB3 with PREADY and PSLVERR.
+    """
+
+    def _identify_signals(self, pattern):
+        matched_sids = self.vcd.match(pattern)
+        if not matched_sids:
+            raise ValueError(f"No signals matched pattern: {pattern}")
+
+        signal_map = {}
+        for sid in matched_sids:
+            path = self.vcd.signals[sid]['path']
+            signal_name = path.split('.')[-1].lower()
+
+            # APB signal identification
+            if 'paddr' in signal_name:
+                signal_map['paddr'] = sid
+            elif 'pwrite' in signal_name:
+                signal_map['pwrite'] = sid
+            elif 'psel' in signal_name:
+                signal_map['psel'] = sid
+            elif 'penable' in signal_name:
+                signal_map['penable'] = sid
+            elif 'pwdata' in signal_name:
+                signal_map['pwdata'] = sid
+            elif 'prdata' in signal_name:
+                signal_map['prdata'] = sid
+            elif 'pready' in signal_name:
+                signal_map['pready'] = sid
+            elif 'pslverr' in signal_name:
+                signal_map['pslverr'] = sid
+
+        return signal_map
+
+    def decode(self, t0, t1):
+        """Decode APB transactions.
+
+        APB state machine:
+        IDLE -> SETUP (psel=1, penable=0) -> ACCESS (psel=1, penable=1, pready=1) -> IDLE
+        """
+        transactions = []
+        violations = []
+        txn_id = 0
+
+        current_vals = {name: None for name in self.signal_map}
+        # APB has three logical states: IDLE / SETUP / ACCESS
+        prev_state = 'IDLE'
+        current_txn = None
+
+        all_sids = list(self.signal_map.values())
+
+        # Group events by timestamp - process all events at same time as a batch,
+        # then evaluate the state transition. This avoids spurious transitions
+        # when multiple signals change at the same time.
+        events_by_time = {}
+        for t, sid, val in self.vcd.iter_events(t0, t1, all_sids):
+            events_by_time.setdefault(t, []).append((sid, val))
+
+        for t in sorted(events_by_time.keys()):
+            # Apply all signal updates at this timestamp
+            for sid, val in events_by_time[t]:
+                for name, s in self.signal_map.items():
+                    if s == sid:
+                        current_vals[name] = val
+                        break
+
+            psel = current_vals.get('psel')
+            penable = current_vals.get('penable')
+            pready = current_vals.get('pready')
+
+            # Determine state
+            if psel == '1' and penable == '0':
+                state = 'SETUP'
+            elif psel == '1' and penable == '1':
+                state = 'ACCESS'
+            else:
+                state = 'IDLE'
+
+            # State transition: IDLE -> SETUP (start of transaction)
+            if prev_state == 'IDLE' and state == 'SETUP':
+                pwrite = current_vals.get('pwrite')
+                paddr = current_vals.get('paddr', '0')
+                pwdata = current_vals.get('pwdata', '0')
+
+                current_txn = {
+                    'id': txn_id,
+                    'type': 'write' if pwrite == '1' else 'read',
+                    'addr': val_to_int(paddr) if paddr else 0,
+                    'addr_time': t,
+                    'status': 'pending',
+                }
+                if pwrite == '1':
+                    current_txn['data'] = val_to_int(pwdata) if pwdata else 0
+                txn_id += 1
+
+            # SETUP -> ACCESS: enable phase started
+            elif prev_state == 'SETUP' and state == 'ACCESS':
+                if current_txn:
+                    current_txn['access_time'] = t
+
+            # Inside ACCESS: check pready, possibly complete transaction
+            if state == 'ACCESS' and pready == '1' and current_txn and current_txn['status'] == 'pending':
+                pslverr = current_vals.get('pslverr')
+                prdata = current_vals.get('prdata', '0')
+
+                current_txn['end_time'] = t
+                if pslverr == '1':
+                    current_txn['status'] = 'SLVERR'
+                else:
+                    current_txn['status'] = 'OKAY'
+
+                if current_txn['type'] == 'read':
+                    current_txn['data'] = val_to_int(prdata) if prdata else 0
+
+                transactions.append(current_txn)
+                current_txn = None
+
+            # State transitions: detect violations
+            if prev_state == 'SETUP' and state == 'IDLE':
+                # Aborted before reaching ACCESS - protocol violation
+                violations.append({
+                    'type': 'protocol_violation',
+                    'time': fmt_time(t, self.ts_sec),
+                    'time_ticks': t,
+                    'severity': 'error',
+                    'description': 'PSEL deasserted in SETUP phase without entering ACCESS'
+                })
+                current_txn = None
+
+            prev_state = state
+
+        # Compute statistics
+        statistics = self._compute_statistics(transactions, t0, t1)
+
+        return transactions, violations, statistics
+
+    def _compute_statistics(self, transactions, t0, t1):
+        if not transactions:
+            return {
+                'total_transactions': 0,
+                'read_count': 0,
+                'write_count': 0,
+                'error_count': 0,
+                'avg_latency': None,
+            }
+
+        reads = [tt for tt in transactions if tt['type'] == 'read']
+        writes = [tt for tt in transactions if tt['type'] == 'write']
+        errors = [tt for tt in transactions if tt.get('status') == 'SLVERR']
+
+        latencies = [tt['end_time'] - tt['addr_time']
+                     for tt in transactions if 'end_time' in tt]
+        avg_latency = sum(latencies) / len(latencies) if latencies else 0
+
+        return {
+            'total_transactions': len(transactions),
+            'read_count': len(reads),
+            'write_count': len(writes),
+            'error_count': len(errors),
+            'avg_latency': fmt_time(int(avg_latency), self.ts_sec) if avg_latency > 0 else None,
+            'avg_latency_ticks': int(avg_latency) if avg_latency > 0 else None,
+        }
+
+
+class UARTDecoder(ProtocolDecoder):
+    """UART protocol decoder.
+
+    Decodes byte values from serial transitions. Auto-detects baud rate by
+    measuring the first start bit duration.
+
+    Signal naming conventions:
+    - tx: signal containing 'tx' or 'txd'
+    - rx: signal containing 'rx' or 'rxd'
+
+    Frame format assumed: 1 start (0), 8 data (LSB first), 1 stop (1)
+    """
+
+    def __init__(self, vcd, signal_pattern, baud_rate=None):
+        self.baud_rate = baud_rate  # bits per second; None = auto-detect
+        super().__init__(vcd, signal_pattern)
+
+    def _identify_signals(self, pattern):
+        matched_sids = self.vcd.match(pattern)
+        if not matched_sids:
+            raise ValueError(f"No signals matched pattern: {pattern}")
+
+        signal_map = {}
+        for sid in matched_sids:
+            path = self.vcd.signals[sid]['path']
+            signal_name = path.split('.')[-1].lower()
+
+            if 'tx' in signal_name and 'rx' not in signal_name:
+                signal_map['tx'] = sid
+            elif 'rx' in signal_name and 'tx' not in signal_name:
+                signal_map['rx'] = sid
+
+        return signal_map
+
+    def decode(self, t0, t1):
+        """Decode UART bytes from each line (TX/RX)."""
+        transactions = []
+        violations = []
+
+        for line_name in ('tx', 'rx'):
+            if line_name not in self.signal_map:
+                continue
+            line_sid = self.signal_map[line_name]
+            line_txns, line_violations = self._decode_line(line_sid, line_name, t0, t1)
+            transactions.extend(line_txns)
+            violations.extend(line_violations)
+
+        # Sort by start time
+        transactions.sort(key=lambda x: x['addr_time'])
+        for i, t in enumerate(transactions):
+            t['id'] = i
+
+        statistics = self._compute_statistics(transactions, t0, t1)
+        return transactions, violations, statistics
+
+    def _decode_line(self, sid, line_name, t0, t1):
+        """Decode bytes on a single UART line."""
+        transactions = []
+        violations = []
+
+        # Collect all transitions on this line
+        events = []
+        for t, s, val in self.vcd.iter_events(t0, t1, [sid]):
+            events.append((t, val))
+
+        if len(events) < 2:
+            return transactions, violations
+
+        # Auto-detect bit duration: smallest gap between transitions tends to be 1 bit
+        # Skip the first event (initial value setup)
+        gaps = []
+        for i in range(1, len(events) - 1):
+            gap = events[i + 1][0] - events[i][0]
+            if gap > 0:
+                gaps.append(gap)
+
+        if not gaps:
+            return transactions, violations
+
+        # Bit time = the minimum gap (assumes at least one single-bit gap)
+        bit_time = min(gaps)
+        if bit_time == 0:
+            return transactions, violations
+
+        # Walk through events looking for falling edges (potential start bits)
+        i = 0
+        while i < len(events) - 1:
+            t, val = events[i]
+            # Look for a falling edge to '0' from '1'
+            if val == '0' and i > 0 and events[i - 1][1] == '1':
+                # Potential start bit
+                start_time = t
+
+                # Sample 8 data bits at start_time + 1.5*bit_time + k*bit_time
+                byte_val = 0
+                valid_frame = True
+                for bit_idx in range(8):
+                    sample_time = start_time + bit_time + bit_idx * bit_time + bit_time // 2
+                    bit_val = self._get_value_at_time(events, sample_time)
+                    if bit_val == '1':
+                        byte_val |= (1 << bit_idx)
+                    elif bit_val != '0':
+                        valid_frame = False
+                        break
+
+                # Check stop bit
+                stop_sample_time = start_time + bit_time + 8 * bit_time + bit_time // 2
+                stop_val = self._get_value_at_time(events, stop_sample_time)
+
+                end_time = start_time + 10 * bit_time
+
+                if not valid_frame:
+                    violations.append({
+                        'type': 'framing_error',
+                        'time': fmt_time(start_time, self.ts_sec),
+                        'time_ticks': start_time,
+                        'severity': 'error',
+                        'description': f'Invalid bit value in {line_name} frame at {fmt_time(start_time, self.ts_sec)}'
+                    })
+                elif stop_val != '1':
+                    violations.append({
+                        'type': 'stop_bit_error',
+                        'time': fmt_time(start_time, self.ts_sec),
+                        'time_ticks': start_time,
+                        'severity': 'error',
+                        'description': f'Missing stop bit on {line_name} at {fmt_time(start_time, self.ts_sec)}'
+                    })
+                else:
+                    transactions.append({
+                        'type': line_name,
+                        'addr': 0,  # UART has no address
+                        'addr_time': start_time,
+                        'end_time': end_time,
+                        'data': byte_val,
+                        'data_ascii': chr(byte_val) if 32 <= byte_val < 127 else '.',
+                        'status': 'OKAY',
+                        'line': line_name,
+                        'bit_time_ticks': bit_time
+                    })
+
+                # Skip past this frame
+                while i < len(events) and events[i][0] < end_time:
+                    i += 1
+                continue
+            i += 1
+
+        return transactions, violations
+
+    def _get_value_at_time(self, events, t):
+        """Get value of line at time t from event list"""
+        last_val = events[0][1] if events else 'x'
+        for tt, val in events:
+            if tt > t:
+                break
+            last_val = val
+        return last_val
+
+    def _compute_statistics(self, transactions, t0, t1):
+        if not transactions:
+            return {
+                'total_transactions': 0,
+                'tx_count': 0,
+                'rx_count': 0,
+                'bit_time': None,
+            }
+
+        tx_count = sum(1 for t in transactions if t['line'] == 'tx')
+        rx_count = sum(1 for t in transactions if t['line'] == 'rx')
+
+        # Estimated bit time = first transaction's measured bit_time
+        bit_time = transactions[0].get('bit_time_ticks', 0)
+        baud_rate = None
+        if bit_time > 0:
+            # baud = 1 / (bit_time * ts_sec)
+            baud_rate = int(round(1.0 / (bit_time * self.ts_sec)))
+
+        return {
+            'total_transactions': len(transactions),
+            'tx_count': tx_count,
+            'rx_count': rx_count,
+            'bit_time': fmt_time(bit_time, self.ts_sec) if bit_time else None,
+            'bit_time_ticks': bit_time,
+            'baud_rate': baud_rate
+        }
+
+
+class SPIDecoder(ProtocolDecoder):
+    """SPI protocol decoder (Mode 0: CPOL=0, CPHA=0).
+
+    Signal naming conventions:
+    - sclk: contains 'sclk' or 'sck'
+    - cs_n: contains 'cs' (chip select, active low)
+    - mosi: contains 'mosi'
+    - miso: contains 'miso'
+
+    Mode 0: MOSI/MISO are sampled on the rising edge of SCLK.
+    """
+
+    def _identify_signals(self, pattern):
+        matched_sids = self.vcd.match(pattern)
+        if not matched_sids:
+            raise ValueError(f"No signals matched pattern: {pattern}")
+
+        signal_map = {}
+        for sid in matched_sids:
+            path = self.vcd.signals[sid]['path']
+            signal_name = path.split('.')[-1].lower()
+
+            if 'sclk' in signal_name or signal_name.endswith('_sck') or signal_name == 'sck':
+                signal_map['sclk'] = sid
+            elif 'mosi' in signal_name:
+                signal_map['mosi'] = sid
+            elif 'miso' in signal_name:
+                signal_map['miso'] = sid
+            elif 'cs' in signal_name and signal_name != 'sclk':
+                # Avoid matching 'spi_sclk' which contains 's' followed by 'c'
+                # More specific: cs_n, ncs, cs0, etc.
+                if 'cs_n' in signal_name or signal_name.endswith('_cs') or 'ncs' in signal_name or signal_name == 'cs':
+                    signal_map['cs_n'] = sid
+
+        return signal_map
+
+    def decode(self, t0, t1):
+        """Decode SPI transactions delimited by CS_N going low/high."""
+        transactions = []
+        violations = []
+        txn_id = 0
+
+        # Validate required signals
+        if 'sclk' not in self.signal_map:
+            raise ValueError("SPI decoder requires sclk signal")
+
+        # Get all signals
+        sclk_sid = self.signal_map['sclk']
+        cs_sid = self.signal_map.get('cs_n')
+        mosi_sid = self.signal_map.get('mosi')
+        miso_sid = self.signal_map.get('miso')
+
+        # Collect all events
+        all_sids = list(self.signal_map.values())
+        events = list(self.vcd.iter_events(t0, t1, all_sids))
+
+        # Current values
+        current = {'sclk': '0', 'cs_n': '1', 'mosi': '0', 'miso': '0'}
+
+        # Track active transaction
+        active_txn = None
+        bits_received_mosi = []
+        bits_received_miso = []
+        prev_sclk = '0'
+        prev_cs = '1'
+
+        for t, sid, val in events:
+            # Map sid to name
+            for name, s in self.signal_map.items():
+                if s == sid:
+                    current[name] = val
+                    break
+
+            sclk = current.get('sclk', '0')
+            cs_n = current.get('cs_n', '1')
+
+            # Detect CS_N falling edge: start of transaction
+            if prev_cs == '1' and cs_n == '0':
+                active_txn = {
+                    'id': txn_id,
+                    'type': 'spi',
+                    'addr': 0,
+                    'addr_time': t,
+                    'status': 'pending',
+                }
+                txn_id += 1
+                bits_received_mosi = []
+                bits_received_miso = []
+                prev_sclk = sclk  # Reset reference
+
+            # SCLK rising edge: sample MOSI/MISO (Mode 0)
+            if active_txn is not None and prev_sclk == '0' and sclk == '1':
+                if mosi_sid is not None:
+                    bits_received_mosi.append(current.get('mosi', '0'))
+                if miso_sid is not None:
+                    bits_received_miso.append(current.get('miso', '0'))
+
+            # Detect CS_N rising edge: end of transaction
+            if active_txn is not None and prev_cs == '0' and cs_n == '1':
+                active_txn['end_time'] = t
+
+                # Convert bits to bytes (MSB first)
+                if bits_received_mosi:
+                    mosi_val = self._bits_to_int(bits_received_mosi)
+                    active_txn['mosi_data'] = mosi_val
+                    active_txn['mosi_bits'] = len(bits_received_mosi)
+                if bits_received_miso:
+                    miso_val = self._bits_to_int(bits_received_miso)
+                    active_txn['miso_data'] = miso_val
+                    active_txn['miso_bits'] = len(bits_received_miso)
+
+                active_txn['status'] = 'OKAY'
+                transactions.append(active_txn)
+                active_txn = None
+
+            prev_sclk = sclk
+            prev_cs = cs_n
+
+        statistics = self._compute_statistics(transactions, t0, t1)
+        return transactions, violations, statistics
+
+    def _bits_to_int(self, bits):
+        """Convert MSB-first bit list to integer"""
+        val = 0
+        for b in bits:
+            val = (val << 1) | (1 if b == '1' else 0)
+        return val
+
+    def _compute_statistics(self, transactions, t0, t1):
+        if not transactions:
+            return {
+                'total_transactions': 0,
+                'avg_bits_per_txn': 0
+            }
+
+        total_bits = sum(t.get('mosi_bits', 0) for t in transactions)
+        return {
+            'total_transactions': len(transactions),
+            'avg_bits_per_txn': total_bits / len(transactions) if transactions else 0
+        }
+
+
 def cmd_protocol_decode(vcd, args):
     """Protocol decode command handler"""
     ts = vcd.ts_sec
@@ -2562,39 +3056,23 @@ def cmd_protocol_decode(vcd, args):
     # Create decoder
     if protocol == 'axi4':
         decoder = AXI4Decoder(vcd, signals)
+    elif protocol == 'apb':
+        decoder = APBDecoder(vcd, signals)
+    elif protocol == 'uart':
+        decoder = UARTDecoder(vcd, signals)
+    elif protocol == 'spi':
+        decoder = SPIDecoder(vcd, signals)
     else:
-        raise ValueError(f"Unsupported protocol: {protocol}")
+        raise ValueError(f"Unsupported protocol: {protocol}; supported: axi4, apb, uart, spi")
 
     # Decode
     transactions, violations, statistics = decoder.decode(t0, t1)
 
-    # Format transactions for output
-    formatted_txns = []
-    for i, txn in enumerate(transactions):
-        formatted = {
-            'id': i,
-            'type': txn['type'],
-            'start_time': fmt_time(txn['addr_time'], ts),
-            'start_time_ticks': txn['addr_time'],
-            'addr': f"0x{txn['addr']:X}",
-            'burst_len': txn['burst_len'],
-            'status': txn['status']
-        }
-        if 'end_time' in txn:
-            formatted['end_time'] = fmt_time(txn['end_time'], ts)
-            formatted['end_time_ticks'] = txn['end_time']
-        if txn['data']:
-            formatted['data'] = [f"0x{d:X}" for d in txn['data']]
-        formatted_txns.append(formatted)
+    # Format transactions for output (protocol-specific)
+    formatted_txns = _format_transactions(transactions, protocol, ts)
 
     # Generate suggestions
-    suggestions = []
-    if violations:
-        suggestions.append(f"Found {len(violations)} protocol violation(s)")
-    if statistics['bandwidth_utilization'] < 0.5:
-        suggestions.append(f"Low bandwidth utilization ({statistics['bandwidth_utilization']*100:.0f}%), check for stalls")
-    if not transactions:
-        suggestions.append("No transactions found in specified time range")
+    suggestions = _generate_suggestions(transactions, violations, statistics, protocol)
 
     # Output
     result = {
@@ -2617,13 +3095,83 @@ def cmd_protocol_decode(vcd, args):
     if args.json:
         _json(result)
     else:
-        # Text output
-        print(f"Protocol: {protocol.upper()}")
-        print(f"Time range: {result['input']['time_range'][0]} ~ {result['input']['time_range'][1]}")
+        _print_protocol_result(result, protocol, statistics, formatted_txns, violations, suggestions, ts)
+
+
+def _format_transactions(transactions, protocol, ts):
+    """Format transactions for output based on protocol"""
+    formatted = []
+    for i, txn in enumerate(transactions):
+        f = {
+            'id': txn.get('id', i),
+            'type': txn['type'],
+            'start_time': fmt_time(txn['addr_time'], ts),
+            'start_time_ticks': txn['addr_time'],
+            'status': txn['status']
+        }
+        if 'end_time' in txn:
+            f['end_time'] = fmt_time(txn['end_time'], ts)
+            f['end_time_ticks'] = txn['end_time']
+
+        if protocol == 'axi4':
+            f['addr'] = f"0x{txn['addr']:X}"
+            f['burst_len'] = txn['burst_len']
+            if txn.get('data'):
+                f['data'] = [f"0x{d:X}" for d in txn['data']]
+        elif protocol == 'apb':
+            f['addr'] = f"0x{txn['addr']:X}"
+            if 'data' in txn:
+                f['data'] = f"0x{txn['data']:X}"
+        elif protocol == 'uart':
+            f['line'] = txn.get('line')
+            f['data'] = f"0x{txn['data']:02X}"
+            f['data_ascii'] = txn.get('data_ascii')
+        elif protocol == 'spi':
+            if 'mosi_data' in txn:
+                f['mosi'] = f"0x{txn['mosi_data']:0{(txn['mosi_bits']+3)//4}X}"
+                f['mosi_bits'] = txn['mosi_bits']
+            if 'miso_data' in txn:
+                f['miso'] = f"0x{txn['miso_data']:0{(txn['miso_bits']+3)//4}X}"
+                f['miso_bits'] = txn['miso_bits']
+
+        formatted.append(f)
+    return formatted
+
+
+def _generate_suggestions(transactions, violations, statistics, protocol):
+    """Generate protocol-specific suggestions"""
+    suggestions = []
+    if violations:
+        suggestions.append(f"Found {len(violations)} protocol violation(s)")
+    if not transactions:
+        suggestions.append("No transactions found in specified time range")
+
+    if protocol == 'axi4':
+        util = statistics.get('bandwidth_utilization', 1.0)
+        if util < 0.5 and transactions:
+            suggestions.append(
+                f"Low bandwidth utilization ({util*100:.0f}%), check for stalls"
+            )
+    elif protocol == 'apb':
+        errors = statistics.get('error_count', 0)
+        if errors > 0:
+            suggestions.append(f"{errors} APB transaction(s) returned SLVERR")
+    elif protocol == 'uart':
+        if statistics.get('baud_rate'):
+            suggestions.append(f"Auto-detected baud rate: {statistics['baud_rate']}")
+
+    return suggestions
+
+
+def _print_protocol_result(result, protocol, statistics, formatted_txns, violations, suggestions, ts):
+    """Print text output for protocol decode result"""
+    print(f"Protocol: {protocol.upper()}")
+    print(f"Time range: {result['input']['time_range'][0]} ~ {result['input']['time_range'][1]}")
+
+    if protocol == 'axi4':
         print(f"\nTransactions: {statistics['total_transactions']}")
         print(f"  Reads:  {statistics['read_count']}")
         print(f"  Writes: {statistics['write_count']}")
-
         if formatted_txns:
             print("\nTransaction Details:")
             for txn in formatted_txns:
@@ -2631,20 +3179,52 @@ def cmd_protocol_decode(vcd, args):
                 print(f"  [{txn['id']}] {txn['type'].upper()}: {txn['addr']} @ {txn['start_time']}{end_str} [{txn['status']}]")
                 if 'data' in txn:
                     print(f"      Data: {', '.join(txn['data'])}")
-
-        if violations:
-            print(f"\nViolations: {len(violations)}")
-            for v in violations:
-                print(f"  [{v['severity'].upper()}] {v['time']}: {v['description']}")
-
         print(f"\nStatistics:")
-        print(f"  Avg Latency: {statistics['avg_latency'] or 'N/A'}")
+        print(f"  Avg Latency: {statistics.get('avg_latency') or 'N/A'}")
         print(f"  Bandwidth Utilization: {statistics['bandwidth_utilization']*100:.1f}%")
 
-        if suggestions:
-            print(f"\nSuggestions:")
-            for s in suggestions:
-                print(f"  - {s}")
+    elif protocol == 'apb':
+        print(f"\nTransactions: {statistics['total_transactions']}")
+        print(f"  Reads:  {statistics['read_count']}")
+        print(f"  Writes: {statistics['write_count']}")
+        print(f"  Errors: {statistics['error_count']}")
+        if formatted_txns:
+            print("\nTransaction Details:")
+            for txn in formatted_txns:
+                data_str = f" data={txn.get('data', '?')}" if 'data' in txn else ""
+                print(f"  [{txn['id']}] {txn['type'].upper()}: {txn['addr']}{data_str} @ {txn['start_time']} [{txn['status']}]")
+        print(f"\nStatistics:")
+        print(f"  Avg Latency: {statistics.get('avg_latency') or 'N/A'}")
+
+    elif protocol == 'uart':
+        print(f"\nBytes decoded: {statistics['total_transactions']}")
+        print(f"  TX: {statistics['tx_count']}")
+        print(f"  RX: {statistics['rx_count']}")
+        if statistics.get('baud_rate'):
+            print(f"  Bit time: {statistics['bit_time']} (~{statistics['baud_rate']} baud)")
+        if formatted_txns:
+            print("\nBytes:")
+            for txn in formatted_txns:
+                print(f"  [{txn['id']}] {txn['line'].upper()}: {txn['data']} '{txn['data_ascii']}' @ {txn['start_time']}")
+
+    elif protocol == 'spi':
+        print(f"\nTransactions: {statistics['total_transactions']}")
+        if formatted_txns:
+            print("\nTransaction Details:")
+            for txn in formatted_txns:
+                mosi = txn.get('mosi', 'N/A')
+                miso = txn.get('miso', 'N/A')
+                print(f"  [{txn['id']}] @ {txn['start_time']} -> {txn.get('end_time', '?')}: MOSI={mosi}, MISO={miso}")
+
+    if violations:
+        print(f"\nViolations: {len(violations)}")
+        for v in violations:
+            print(f"  [{v['severity'].upper()}] {v['time']}: {v['description']}")
+
+    if suggestions:
+        print(f"\nSuggestions:")
+        for s in suggestions:
+            print(f"  - {s}")
 
 
 # -- FSM Trace ---------------------------------------------------------------
@@ -2873,6 +3453,746 @@ def cmd_fsm_trace(vcd, args):
                 print(f"  - {s}")
 
 
+# -- Causality Analysis ------------------------------------------------------
+
+class CausalityAnalyzer:
+    """Analyze potential causes for a signal change.
+
+    The analyzer searches for signals that changed before the effect time
+    within a configurable window, then ranks them by:
+    1. Temporal proximity (closer in time = more likely cause)
+    2. Historical correlation (does this pattern repeat?)
+    3. Value change direction matching
+    """
+
+    def __init__(self, vcd):
+        self.vcd = vcd
+        self.ts_sec = vcd.ts_sec
+
+    def analyze(self, effect_signal, effect_time, window):
+        """Find potential causes for effect_signal change at effect_time.
+
+        Args:
+            effect_signal: signal pattern (must match exactly one signal)
+            effect_time: time of the effect (in ticks)
+            window: search window before effect_time (in ticks)
+
+        Returns:
+            (effect_info, potential_causes, causal_chain)
+        """
+        # Resolve effect signal
+        matched = self.vcd.match([effect_signal])
+        if not matched:
+            raise ValueError(f"Effect signal not found: {effect_signal}")
+        if len(matched) > 1:
+            raise ValueError(f"Effect signal matched multiple signals: {effect_signal}")
+        effect_sid = list(matched)[0]
+        effect_path = self.vcd.signals[effect_sid]['path']
+
+        # Find the effect value at effect_time
+        effect_value = self._get_value_at(effect_sid, effect_time)
+
+        effect_info = {
+            'signal': effect_path,
+            'time': fmt_time(effect_time, self.ts_sec),
+            'time_ticks': effect_time,
+            'value': effect_value
+        }
+
+        # Identify clock-like signals (high frequency toggling) to filter them out.
+        # A signal is considered a clock if it toggles much more frequently than
+        # the effect signal, since clocks are usually not the *cause* of an event,
+        # just a synchronizer.
+        clock_sids = self._identify_clock_signals(effect_sid)
+
+        # Collect all signal changes in the search window
+        t0 = max(0, effect_time - window)
+        t1 = effect_time
+
+        # Group changes by signal
+        signal_changes = {}  # sid -> [(time, value), ...]
+        for t, sid, val in self.vcd.iter_events(t0, t1):
+            if sid == effect_sid:
+                continue  # Skip the effect signal itself
+            if sid in clock_sids:
+                continue  # Skip clock signals
+            if sid not in signal_changes:
+                signal_changes[sid] = []
+            signal_changes[sid].append((t, val))
+
+        # Compute correlation for each candidate signal
+        candidates = []
+        for sid, changes in signal_changes.items():
+            if not changes:
+                continue
+
+            # Use the latest change before effect_time
+            last_change_time, last_value = changes[-1]
+            delta = effect_time - last_change_time
+
+            # Temporal proximity score (closer = higher)
+            # Linear decay: 1.0 at delta=0, 0.0 at delta=window
+            temporal_score = max(0.0, 1.0 - (delta / window)) if window > 0 else 0.0
+
+            # Historical correlation: check if this signal change pattern
+            # has historically preceded effect signal changes
+            historical_score, occurrences, total_effect_events = self._compute_historical_correlation(
+                sid, effect_sid, window)
+
+            # Combined correlation (weighted average)
+            # Temporal proximity is the primary signal; historical correlation
+            # is a tiebreaker and confidence booster
+            correlation = 0.4 * temporal_score + 0.6 * historical_score
+
+            # Confidence based on number of occurrences
+            if occurrences >= 5:
+                confidence = 'high'
+            elif occurrences >= 2:
+                confidence = 'medium'
+            else:
+                confidence = 'low'
+
+            sig_path = self.vcd.signals[sid]['path']
+
+            candidates.append({
+                'signal': sig_path,
+                'change_time': fmt_time(last_change_time, self.ts_sec),
+                'change_time_ticks': last_change_time,
+                'delta': fmt_time(delta, self.ts_sec),
+                'delta_ticks': delta,
+                'value': fmt_val(last_value, self.vcd.signals[sid]),
+                'correlation': round(correlation, 3),
+                'temporal_score': round(temporal_score, 3),
+                'historical_score': round(historical_score, 3),
+                'confidence': confidence,
+                'pattern': f"{sig_path} changed -> {effect_path} changed (observed {occurrences}/{total_effect_events} times)"
+            })
+
+        # Sort by correlation (descending)
+        candidates.sort(key=lambda x: x['correlation'], reverse=True)
+
+        # Filter low-correlation candidates (< 0.1)
+        candidates = [c for c in candidates if c['correlation'] >= 0.1]
+
+        # Build causal chain from top candidates
+        causal_chain = self._build_causal_chain(candidates, effect_info, signal_changes)
+
+        return effect_info, candidates, causal_chain
+
+    def _identify_clock_signals(self, effect_sid):
+        """Identify clock-like signals (frequent regular toggling).
+
+        A signal is considered clock-like if:
+        1. It has many more transitions than the effect signal (>= 10x)
+        2. Its transitions are roughly regular in interval
+
+        Returns a set of signal IDs to exclude.
+        """
+        clock_sids = set()
+
+        # Count transitions for effect signal
+        effect_count = sum(1 for _ in self.vcd.iter_events(0, None, [effect_sid]))
+        if effect_count == 0:
+            return clock_sids
+
+        # For each signal, check if it toggles much more frequently
+        for sid in self.vcd.signals:
+            if sid == effect_sid:
+                continue
+
+            # Quick check: name contains common clock identifiers
+            sig_path = self.vcd.signals[sid]['path'].lower()
+            sig_name = sig_path.split('.')[-1]
+            if sig_name in ('clk', 'clock', 'ck') or sig_name.endswith('_clk') or sig_name.endswith('_clock'):
+                clock_sids.add(sid)
+                continue
+
+            # Frequency check: count transitions
+            count = sum(1 for _ in self.vcd.iter_events(0, None, [sid]))
+            if count >= effect_count * 10 and count >= 20:
+                # Very high frequency: likely a clock
+                clock_sids.add(sid)
+
+        return clock_sids
+
+    def _get_value_at(self, sid, t):
+        """Get the value of a signal at a specific time"""
+        last_value = None
+        for tt, ss, val in self.vcd.iter_events(0, t + 1, [sid]):
+            if tt > t:
+                break
+            last_value = val
+        return fmt_val(last_value, self.vcd.signals[sid]) if last_value else 'unknown'
+
+    def _compute_historical_correlation(self, candidate_sid, effect_sid, window):
+        """Check how often candidate signal changes precede effect signal changes.
+
+        Returns:
+            (correlation_score, matching_occurrences, total_effect_events)
+        """
+        # Collect all changes of the effect signal
+        effect_times = []
+        for t, sid, val in self.vcd.iter_events(0, None, [effect_sid]):
+            effect_times.append(t)
+
+        if len(effect_times) < 2:
+            # Not enough history to compute correlation
+            return 0.0, 0, len(effect_times)
+
+        # For each effect event, check if candidate changed within window before it
+        candidate_times = []
+        for t, sid, val in self.vcd.iter_events(0, None, [candidate_sid]):
+            candidate_times.append(t)
+
+        if not candidate_times:
+            return 0.0, 0, len(effect_times)
+
+        # Count matches: candidate change followed by effect change within window
+        matches = 0
+        for effect_t in effect_times:
+            # Look for candidate change in [effect_t - window, effect_t]
+            t_low = max(0, effect_t - window)
+            for cand_t in candidate_times:
+                if t_low <= cand_t <= effect_t:
+                    matches += 1
+                    break  # One match per effect event
+
+        # Correlation = matches / total effect events
+        correlation = matches / len(effect_times) if effect_times else 0.0
+        return correlation, matches, len(effect_times)
+
+    def _build_causal_chain(self, candidates, effect_info, signal_changes):
+        """Build a causal chain showing signal changes leading to the effect.
+
+        The chain is constructed from the top candidates by sorting them
+        chronologically.
+        """
+        if not candidates:
+            return []
+
+        # Take top 5 candidates
+        top_candidates = candidates[:5]
+
+        # Build chain entries
+        chain_entries = []
+        for cand in top_candidates:
+            chain_entries.append({
+                'signal': cand['signal'],
+                'time': cand['change_time'],
+                'time_ticks': cand['change_time_ticks'],
+                'value': cand['value']
+            })
+
+        # Add the effect at the end
+        chain_entries.append({
+            'signal': effect_info['signal'],
+            'time': effect_info['time'],
+            'time_ticks': effect_info['time_ticks'],
+            'value': effect_info['value']
+        })
+
+        # Sort chronologically
+        chain_entries.sort(key=lambda x: x['time_ticks'])
+
+        return chain_entries
+
+
+def cmd_causality(vcd, args):
+    """Causality analysis command handler"""
+    ts = vcd.ts_sec
+
+    # Parse effect time
+    effect_time = parse_time(args.at, ts)
+
+    # Parse search window (default: 100ns)
+    if args.window:
+        window = parse_time(args.window, ts)
+    else:
+        window = parse_time('100ns', ts)
+
+    # Create analyzer
+    analyzer = CausalityAnalyzer(vcd)
+
+    # Analyze
+    effect_info, candidates, causal_chain = analyzer.analyze(
+        args.effect, effect_time, window)
+
+    # Generate suggestions
+    suggestions = []
+    if candidates:
+        top = candidates[0]
+        if top['correlation'] >= 0.7:
+            suggestions.append(
+                f"High correlation with {top['signal']} ({top['correlation']:.0%}), "
+                f"likely root cause"
+            )
+        elif top['correlation'] >= 0.4:
+            suggestions.append(
+                f"Moderate correlation with {top['signal']} ({top['correlation']:.0%}), "
+                f"investigate further"
+            )
+        else:
+            suggestions.append(
+                f"Weak correlation with top candidate {top['signal']} "
+                f"({top['correlation']:.0%}), consider expanding search window"
+            )
+
+        if len(candidates) > 1:
+            suggestions.append(
+                f"Found {len(candidates)} potential causes; "
+                f"check causal_chain for temporal ordering"
+            )
+    else:
+        suggestions.append(
+            "No correlated signals found in search window; "
+            "try expanding --window or check for spontaneous events"
+        )
+
+    # Build result
+    result = {
+        'status': 'success',
+        'skill': 'causality',
+        'input': {
+            'file': vcd.path,
+            'effect_signal': args.effect,
+            'effect_time': fmt_time(effect_time, ts),
+            'effect_time_ticks': effect_time,
+            'search_window': fmt_time(window, ts),
+            'search_window_ticks': window
+        },
+        'result': {
+            'effect': effect_info,
+            'potential_causes': candidates,
+            'causal_chain': causal_chain
+        },
+        'suggestions': suggestions
+    }
+
+    if args.json:
+        _json(result)
+    else:
+        # Text output
+        print(f"Effect Signal: {effect_info['signal']}")
+        print(f"Effect Time:   {effect_info['time']} (value={effect_info['value']})")
+        print(f"Search Window: {fmt_time(window, ts)} before effect")
+
+        if candidates:
+            print(f"\nPotential Causes: {len(candidates)} found")
+            print(f"  {'#':<3} {'Signal':<50} {'Delta':<10} {'Value':<10} {'Corr':<8} {'Confidence'}")
+            for i, c in enumerate(candidates[:10]):
+                print(f"  {i:<3} {c['signal']:<50} {c['delta']:<10} {str(c['value']):<10} "
+                      f"{c['correlation']:<8} {c['confidence']}")
+            if len(candidates) > 10:
+                print(f"  ... and {len(candidates) - 10} more")
+        else:
+            print("\nNo correlated signals found in search window.")
+
+        if causal_chain:
+            print(f"\nCausal Chain (chronological):")
+            for entry in causal_chain:
+                marker = " <-- EFFECT" if entry['signal'] == effect_info['signal'] else ""
+                print(f"  {entry['time']:<12} {entry['signal']:<50} = {entry['value']}{marker}")
+
+        if suggestions:
+            print(f"\nSuggestions:")
+            for s in suggestions:
+                print(f"  - {s}")
+
+
+# -- Anomaly Detection -------------------------------------------------------
+
+class AnomalyDetector:
+    """Detect common waveform anomalies.
+
+    Supported anomaly types:
+    - stuck_signal: signal does not change for an extended period
+    - glitch: pulse narrower than minimum width
+    - metastability: x/z values observed during simulation
+    - bus_contention: all-x or all-z values on multi-bit signals
+    """
+
+    def __init__(self, vcd):
+        self.vcd = vcd
+        self.ts_sec = vcd.ts_sec
+
+    def detect(self, t0, t1, sids=None,
+               stuck_threshold=None,
+               glitch_threshold=None,
+               check_metastability=True,
+               check_bus_contention=True):
+        """Run all anomaly detectors and return findings.
+
+        Args:
+            t0, t1: time range
+            sids: optional set of signal IDs to check
+            stuck_threshold: ticks beyond which a static signal is "stuck"
+                             (default: 50% of analysis window or 100us)
+            glitch_threshold: ticks below which a pulse is a "glitch"
+                              (default: 5ns)
+            check_metastability: detect x/z values
+            check_bus_contention: detect all-x/z on multi-bit signals
+
+        Returns:
+            list of anomaly dicts
+        """
+        # Default thresholds
+        if t1 is None:
+            t1 = self.vcd.scan_time_range()[1] or 0
+        analysis_window = t1 - t0
+
+        if stuck_threshold is None:
+            # 50% of analysis window, but not less than 100us
+            stuck_threshold = max(analysis_window // 2,
+                                  int(100e-6 / self.ts_sec))
+        if glitch_threshold is None:
+            # 5ns default
+            glitch_threshold = int(5e-9 / self.ts_sec)
+
+        # Determine which signals to check
+        if sids is None:
+            sids = set(self.vcd.signals.keys())
+        else:
+            sids = set(sids)
+
+        anomalies = []
+
+        # Collect all events into per-signal change lists
+        signal_events = {sid: [] for sid in sids}
+        for t, sid, val in self.vcd.iter_events(t0, t1, sids):
+            signal_events[sid].append((t, val))
+
+        # Run each detector
+        for sid in sids:
+            events = signal_events[sid]
+            info = self.vcd.signals[sid]
+            path = info['path']
+            width = info['width']
+
+            # Detect stuck signals
+            self._detect_stuck(anomalies, sid, path, events, t0, t1, stuck_threshold)
+
+            # Detect glitches (only single-bit signals)
+            if width == 1:
+                self._detect_glitch(anomalies, sid, path, events, glitch_threshold)
+
+            # Detect metastability / unknown values
+            if check_metastability:
+                self._detect_unknown_values(anomalies, sid, path, events, width,
+                                             check_bus_contention)
+
+        # Sort by time (earliest first)
+        anomalies.sort(key=lambda a: a.get('time_ticks', 0))
+
+        # Compute summary
+        summary = self._compute_summary(anomalies)
+
+        return anomalies, summary
+
+    def _detect_stuck(self, anomalies, sid, path, events, t0, t1, threshold):
+        """Detect signals that don't change for >= threshold ticks.
+
+        We consider two cases:
+        1. Signal has no events in window: stuck for the entire window
+        2. Signal has long gaps between events
+        """
+        if not events:
+            # No changes at all -- check if the signal exists earlier
+            # Signal is stuck for entire window
+            duration = t1 - t0
+            if duration >= threshold:
+                anomalies.append({
+                    'type': 'stuck_signal',
+                    'signal': path,
+                    'time': fmt_time(t0, self.ts_sec),
+                    'time_ticks': t0,
+                    'time_range': [fmt_time(t0, self.ts_sec), fmt_time(t1, self.ts_sec)],
+                    'duration': fmt_time(duration, self.ts_sec),
+                    'duration_ticks': duration,
+                    'severity': self._stuck_severity(duration, threshold),
+                    'description': f"Signal stuck (no changes) for {fmt_time(duration, self.ts_sec)}"
+                })
+            return
+
+        # Check gap from window start to first event
+        first_t, _ = events[0]
+        gap = first_t - t0
+        if gap >= threshold:
+            anomalies.append({
+                'type': 'stuck_signal',
+                'signal': path,
+                'time': fmt_time(t0, self.ts_sec),
+                'time_ticks': t0,
+                'time_range': [fmt_time(t0, self.ts_sec), fmt_time(first_t, self.ts_sec)],
+                'duration': fmt_time(gap, self.ts_sec),
+                'duration_ticks': gap,
+                'severity': self._stuck_severity(gap, threshold),
+                'description': f"Signal stuck for {fmt_time(gap, self.ts_sec)} before first change"
+            })
+
+        # Check gaps between consecutive events
+        for i in range(len(events) - 1):
+            t_curr, _ = events[i]
+            t_next, _ = events[i + 1]
+            gap = t_next - t_curr
+            if gap >= threshold:
+                anomalies.append({
+                    'type': 'stuck_signal',
+                    'signal': path,
+                    'time': fmt_time(t_curr, self.ts_sec),
+                    'time_ticks': t_curr,
+                    'time_range': [fmt_time(t_curr, self.ts_sec), fmt_time(t_next, self.ts_sec)],
+                    'duration': fmt_time(gap, self.ts_sec),
+                    'duration_ticks': gap,
+                    'severity': self._stuck_severity(gap, threshold),
+                    'description': f"Signal stuck for {fmt_time(gap, self.ts_sec)}"
+                })
+
+        # Check gap from last event to window end
+        last_t, _ = events[-1]
+        gap = t1 - last_t
+        if gap >= threshold:
+            anomalies.append({
+                'type': 'stuck_signal',
+                'signal': path,
+                'time': fmt_time(last_t, self.ts_sec),
+                'time_ticks': last_t,
+                'time_range': [fmt_time(last_t, self.ts_sec), fmt_time(t1, self.ts_sec)],
+                'duration': fmt_time(gap, self.ts_sec),
+                'duration_ticks': gap,
+                'severity': self._stuck_severity(gap, threshold),
+                'description': f"Signal stuck for {fmt_time(gap, self.ts_sec)} until window end"
+            })
+
+    def _stuck_severity(self, duration, threshold):
+        """Classify stuck severity based on how long it's been stuck"""
+        if duration >= threshold * 10:
+            return 'critical'
+        elif duration >= threshold * 3:
+            return 'error'
+        else:
+            return 'warning'
+
+    def _detect_glitch(self, anomalies, sid, path, events, threshold):
+        """Detect pulses (single-bit signals) narrower than threshold.
+
+        A glitch is a 0->1->0 or 1->0->1 pattern with intermediate state
+        held for less than threshold.
+        """
+        if len(events) < 2:
+            return
+
+        for i in range(len(events) - 1):
+            t_start, val_start = events[i]
+            t_end, val_end = events[i + 1]
+            pulse_width = t_end - t_start
+
+            # Glitch: short pulse with returning value
+            if pulse_width < threshold and pulse_width > 0:
+                # Check if this is actually a pulse (value returns to original)
+                if i + 2 < len(events):
+                    _, val_after = events[i + 2]
+                else:
+                    val_after = None
+
+                # A true glitch returns to the original value
+                # We focus on isolated short pulses
+                if val_start in ('0', '1') and val_end in ('0', '1') and val_start != val_end:
+                    anomalies.append({
+                        'type': 'glitch',
+                        'signal': path,
+                        'time': fmt_time(t_start, self.ts_sec),
+                        'time_ticks': t_start,
+                        'duration': fmt_time(pulse_width, self.ts_sec),
+                        'duration_ticks': pulse_width,
+                        'severity': 'warning',
+                        'description': f"Pulse width {fmt_time(pulse_width, self.ts_sec)} < minimum expected {fmt_time(threshold, self.ts_sec)}"
+                    })
+
+    def _detect_unknown_values(self, anomalies, sid, path, events, width, check_bus):
+        """Detect x/z values (metastability) and bus contention"""
+        for t, val in events:
+            val_lower = val.lower() if val else ''
+            if not val_lower:
+                continue
+
+            # Check for any x/z characters
+            has_x = 'x' in val_lower
+            has_z = 'z' in val_lower
+
+            if not (has_x or has_z):
+                continue
+
+            # Determine if it's full unknown (bus contention) or partial (metastability)
+            # Strip leading 'b' from binary representation
+            clean_val = val_lower.lstrip('b')
+
+            if width > 1 and check_bus:
+                # Multi-bit signal: check if all bits are x or z
+                all_unknown = all(c in ('x', 'z') for c in clean_val if c != ' ')
+                if all_unknown and len(clean_val) > 0:
+                    anomalies.append({
+                        'type': 'bus_contention',
+                        'signal': path,
+                        'time': fmt_time(t, self.ts_sec),
+                        'time_ticks': t,
+                        'value': val,
+                        'severity': 'error',
+                        'description': f"Bus contention detected (all bits unknown: {val})"
+                    })
+                    continue
+
+            # Otherwise it's metastability (some bits unknown)
+            anomalies.append({
+                'type': 'metastability',
+                'signal': path,
+                'time': fmt_time(t, self.ts_sec),
+                'time_ticks': t,
+                'value': val,
+                'severity': 'error',
+                'description': f"Unknown value detected: {val}"
+            })
+
+    def _compute_summary(self, anomalies):
+        """Summarize anomalies by type and severity"""
+        summary = {
+            'total_anomalies': len(anomalies),
+            'critical': 0,
+            'error': 0,
+            'warning': 0,
+            'by_type': {}
+        }
+
+        for a in anomalies:
+            severity = a.get('severity', 'warning')
+            anom_type = a.get('type', 'unknown')
+
+            if severity in summary:
+                summary[severity] += 1
+
+            if anom_type not in summary['by_type']:
+                summary['by_type'][anom_type] = 0
+            summary['by_type'][anom_type] += 1
+
+        return summary
+
+
+def cmd_anomaly_detect(vcd, args):
+    """Anomaly detection command handler"""
+    ts = vcd.ts_sec
+    t0 = parse_time(args.begin, ts) if args.begin else 0
+    t1 = parse_time(args.end, ts) if args.end else None
+
+    # Determine which signals to check
+    sids = vcd.match(args.filter)
+
+    # Parse thresholds
+    stuck_threshold = None
+    if args.stuck_threshold:
+        stuck_threshold = parse_time(args.stuck_threshold, ts)
+
+    glitch_threshold = None
+    if args.glitch_threshold:
+        glitch_threshold = parse_time(args.glitch_threshold, ts)
+
+    # Run detection
+    detector = AnomalyDetector(vcd)
+    anomalies, summary = detector.detect(
+        t0, t1, sids=sids,
+        stuck_threshold=stuck_threshold,
+        glitch_threshold=glitch_threshold)
+
+    # Generate suggestions
+    suggestions = []
+    if summary['critical'] > 0:
+        suggestions.append(
+            f"Critical: {summary['critical']} critical anomaly(ies) found, "
+            f"investigate immediately"
+        )
+    if summary['by_type'].get('metastability', 0) > 0:
+        suggestions.append(
+            f"{summary['by_type']['metastability']} metastability issue(s); "
+            f"review CDC (Clock Domain Crossing) design"
+        )
+    if summary['by_type'].get('bus_contention', 0) > 0:
+        suggestions.append(
+            f"{summary['by_type']['bus_contention']} bus contention(s); "
+            f"check for multiple drivers"
+        )
+    if summary['by_type'].get('glitch', 0) > 0:
+        suggestions.append(
+            f"{summary['by_type']['glitch']} glitch(es); "
+            f"check pulse width requirements"
+        )
+    if summary['by_type'].get('stuck_signal', 0) > 0:
+        suggestions.append(
+            f"{summary['by_type']['stuck_signal']} stuck signal(s); "
+            f"verify expected activity"
+        )
+    if summary['total_anomalies'] == 0:
+        suggestions.append("No anomalies detected; waveform appears clean")
+
+    # Compute defaults used (for transparency)
+    if t1 is None:
+        t1 = vcd.scan_time_range()[1] or 0
+    if stuck_threshold is None:
+        stuck_threshold = max((t1 - t0) // 2, int(100e-6 / ts))
+    if glitch_threshold is None:
+        glitch_threshold = int(5e-9 / ts)
+
+    # Build result
+    result = {
+        'status': 'success',
+        'skill': 'anomaly_detect',
+        'input': {
+            'file': vcd.path,
+            'time_range': [fmt_time(t0, ts), fmt_time(t1, ts) if t1 else 'end'],
+            'signals_analyzed': len(sids) if sids is not None else len(vcd.signals),
+            'stuck_threshold': fmt_time(stuck_threshold, ts),
+            'glitch_threshold': fmt_time(glitch_threshold, ts)
+        },
+        'result': {
+            'anomalies': anomalies,
+            'summary': summary
+        },
+        'suggestions': suggestions
+    }
+
+    if args.json:
+        _json(result)
+    else:
+        # Text output
+        print(f"Anomaly Detection Report")
+        print(f"Time range: {result['input']['time_range'][0]} ~ {result['input']['time_range'][1]}")
+        print(f"Signals analyzed: {result['input']['signals_analyzed']}")
+        print(f"Thresholds: stuck >= {result['input']['stuck_threshold']}, "
+              f"glitch < {result['input']['glitch_threshold']}")
+
+        print(f"\nSummary:")
+        print(f"  Total anomalies: {summary['total_anomalies']}")
+        print(f"  Critical: {summary['critical']}")
+        print(f"  Error:    {summary['error']}")
+        print(f"  Warning:  {summary['warning']}")
+
+        if summary['by_type']:
+            print(f"\nBy type:")
+            for anom_type, count in sorted(summary['by_type'].items()):
+                print(f"  {anom_type}: {count}")
+
+        if anomalies:
+            print(f"\nAnomalies (showing first 20):")
+            for a in anomalies[:20]:
+                sev = a.get('severity', 'warning').upper()
+                print(f"  [{sev:<8}] {a['time']:<12} {a['type']:<18} {a['signal']}")
+                print(f"             {a['description']}")
+            if len(anomalies) > 20:
+                print(f"  ... and {len(anomalies) - 20} more")
+
+        if suggestions:
+            print(f"\nSuggestions:")
+            for s in suggestions:
+                print(f"  - {s}")
+
+
 # -- CLI entry ---------------------------------------------------------------
 
 def _add_time_args(sp):
@@ -2960,6 +4280,24 @@ def main():
                     help='threshold for stuck state detection (e.g., 100us); default: 100us')
     _add_time_args(sp); _add_common(sp)
 
+    sp = sub.add_parser('causality', help='find potential causes for a signal change')
+    sp.add_argument('file', metavar='<file>')
+    sp.add_argument('--effect', metavar='SIGNAL', required=True,
+                    help='effect signal name or pattern (must match exactly one signal)')
+    sp.add_argument('--at', metavar='TIME', required=True,
+                    help='time when the effect occurred (e.g., 17.5us)')
+    sp.add_argument('--window', metavar='DURATION',
+                    help='search window before effect time (e.g., 100ns); default: 100ns')
+    _add_common(sp)
+
+    sp = sub.add_parser('anomaly-detect', help='detect waveform anomalies (stuck, glitch, metastability, bus contention)')
+    sp.add_argument('file', metavar='<file>')
+    sp.add_argument('--stuck-threshold', metavar='TIME',
+                    help='ticks beyond which a static signal is "stuck"; default: 50%% of window or 100us')
+    sp.add_argument('--glitch-threshold', metavar='TIME',
+                    help='pulse width below which a single-bit transition is a "glitch"; default: 5ns')
+    _add_time_args(sp); _add_filter(sp); _add_common(sp)
+
     args = p.parse_args()
     if not args.cmd:
         p.print_help()
@@ -2969,7 +4307,8 @@ def main():
         vcd = VCDParser(args.file)
         cmds = {'info': cmd_info, 'list': cmd_list, 'dump': cmd_dump, 'summary': cmd_summary,
                 'snapshot': cmd_snapshot, 'compare': cmd_compare, 'search': cmd_search,
-                'protocol-decode': cmd_protocol_decode, 'fsm-trace': cmd_fsm_trace}
+                'protocol-decode': cmd_protocol_decode, 'fsm-trace': cmd_fsm_trace,
+                'causality': cmd_causality, 'anomaly-detect': cmd_anomaly_detect}
         cmds[args.cmd](vcd, args)
     except FileNotFoundError as e:
         sys.exit('Error: cannot open VCD file: {}'.format(e.filename or args.file))
