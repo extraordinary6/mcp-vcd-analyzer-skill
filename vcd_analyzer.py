@@ -2231,6 +2231,151 @@ def cmd_search(vcd, args):
             noun, fmt_time(t0, ts), fmt_time(t1, ts), cond_text))
 
 
+# -- Skill Framework ---------------------------------------------------------
+#
+# Phase 2 standardizes the JSON output shape across all Skills so AI Agents
+# can consume responses uniformly. Every Skill emits:
+#
+#   {
+#     "status": "success" | "error",
+#     "skill": "<name>",
+#     "execution_time_ms": <int>,
+#     "input": { ... },
+#     "result": { ... },          # only on success
+#     "metadata": { ... },        # only on success
+#     "suggestions": [ ... ],
+#     "error": { code, message, details }   # only on error
+#   }
+#
+# Helpers below build the response and structured error objects. Existing
+# fields inside "result"/"input" are preserved, so older tests keep passing.
+
+import time as _time
+
+# Stable error codes Agents can branch on. New codes can be added without
+# breaking existing consumers.
+SKILL_ERROR_CODES = {
+    'FILE_NOT_FOUND',
+    'PARSE_ERROR',
+    'INVALID_PROTOCOL',
+    'SIGNAL_NOT_FOUND',
+    'INVALID_TIME_RANGE',
+    'INVALID_ARGUMENT',
+    'INSUFFICIENT_DATA',
+    'RESOURCE_LIMIT',
+    'INTERNAL_ERROR',
+}
+
+
+class SkillError(Exception):
+    """Raised by Skills to emit a structured error response.
+
+    Caught by run_skill() and converted into the standard JSON error envelope.
+    Carry an error code (one of SKILL_ERROR_CODES), a human-readable message,
+    and an optional details dict for Agent-side diagnostics.
+    """
+    def __init__(self, code, message, details=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+
+def _build_metadata(vcd, t0, t1, signals_matched=None):
+    """Build the standard metadata block included in every Skill response."""
+    try:
+        file_size = os.path.getsize(vcd.path)
+    except OSError:
+        file_size = None
+
+    if signals_matched is None:
+        signals_matched = len(vcd.signals)
+
+    md = {
+        'vcd_file_size': file_size,
+        'analyzer_version': __version__,
+        'signals_matched': signals_matched,
+    }
+    if t0 is not None or t1 is not None:
+        md['time_range_analyzed'] = [
+            fmt_time(t0 or 0, vcd.ts_sec),
+            fmt_time(t1, vcd.ts_sec) if t1 is not None else 'end',
+        ]
+    return md
+
+
+def _skill_envelope(skill_name, started_at, input_dict, result, metadata, suggestions):
+    """Assemble a successful Skill response with execution_time_ms populated."""
+    elapsed_ms = int(round((_time.perf_counter() - started_at) * 1000))
+    envelope = {
+        'status': 'success',
+        'skill': skill_name,
+        'execution_time_ms': elapsed_ms,
+        'input': input_dict,
+        'result': result,
+        'metadata': metadata,
+        'suggestions': suggestions,
+    }
+    return envelope
+
+
+def _skill_error_envelope(skill_name, started_at, input_dict, code, message, details=None):
+    """Assemble an error response. Used by run_skill() exception handlers."""
+    elapsed_ms = int(round((_time.perf_counter() - started_at) * 1000))
+    return {
+        'status': 'error',
+        'skill': skill_name,
+        'execution_time_ms': elapsed_ms,
+        'input': input_dict,
+        'error': {
+            'code': code,
+            'message': message,
+            'details': details or {},
+        },
+        'suggestions': [],
+    }
+
+
+def run_skill(skill_name, args, fn):
+    """Execute a Skill handler `fn(args, started_at)` with unified error handling.
+
+    The handler should either:
+      - return None (handler does its own printing — for backward compatibility), or
+      - return a fully-built envelope dict (preferred for new Skills).
+
+    Exceptions raised by `fn` are translated into structured error envelopes
+    when --json is requested. In text mode, they fall through to the existing
+    main() error handlers so the CLI experience is unchanged.
+    """
+    started_at = _time.perf_counter()
+    try:
+        return fn(args, started_at)
+    except SkillError as e:
+        if getattr(args, 'json', False):
+            envelope = _skill_error_envelope(
+                skill_name, started_at,
+                _skill_input_from_args(args, skill_name),
+                e.code, e.message, e.details
+            )
+            _json(envelope)
+            sys.exit(1)
+        else:
+            sys.exit('Error [{}]: {}'.format(e.code, e.message))
+
+
+def _skill_input_from_args(args, skill_name):
+    """Build a best-effort input echo from argparse Namespace for error envelopes."""
+    inp = {'file': getattr(args, 'file', None)}
+    # Skill-specific arguments
+    for key in ('protocol', 'signals', 'state', 'stuck_threshold',
+                'glitch_threshold', 'effect', 'at', 'window', 'filter',
+                'begin', 'end'):
+        val = getattr(args, key, None)
+        if val is not None:
+            inp[key] = val
+    return inp
+
+
 # -- Protocol Decoders -------------------------------------------------------
 
 class ProtocolDecoder:
@@ -3041,61 +3186,81 @@ class SPIDecoder(ProtocolDecoder):
 
 def cmd_protocol_decode(vcd, args):
     """Protocol decode command handler"""
-    ts = vcd.ts_sec
-    t0 = parse_time(args.begin, ts) if args.begin else 0
-    t1 = parse_time(args.end, ts) if args.end else None
+    def _run(args, started_at):
+        ts = vcd.ts_sec
+        try:
+            t0 = parse_time(args.begin, ts) if args.begin else 0
+            t1 = parse_time(args.end, ts) if args.end else None
+        except _TimeParseError as e:
+            raise SkillError('INVALID_TIME_RANGE', str(e))
 
-    protocol = args.protocol.lower()
+        protocol = args.protocol.lower()
 
-    # Normalize signal pattern
-    if args.signals:
-        signals = _normalize_filter_patterns(args.signals)
-    else:
-        signals = None
+        # Normalize signal pattern
+        if args.signals:
+            try:
+                signals = _normalize_filter_patterns(args.signals)
+            except _FilterParseError as e:
+                raise SkillError('INVALID_ARGUMENT',
+                                  'invalid --signals pattern: {}'.format(e))
+        else:
+            signals = None
 
-    # Create decoder
-    if protocol == 'axi4':
-        decoder = AXI4Decoder(vcd, signals)
-    elif protocol == 'apb':
-        decoder = APBDecoder(vcd, signals)
-    elif protocol == 'uart':
-        decoder = UARTDecoder(vcd, signals)
-    elif protocol == 'spi':
-        decoder = SPIDecoder(vcd, signals)
-    else:
-        raise ValueError(f"Unsupported protocol: {protocol}; supported: axi4, apb, uart, spi")
+        # Create decoder
+        try:
+            if protocol == 'axi4':
+                decoder = AXI4Decoder(vcd, signals)
+            elif protocol == 'apb':
+                decoder = APBDecoder(vcd, signals)
+            elif protocol == 'uart':
+                decoder = UARTDecoder(vcd, signals)
+            elif protocol == 'spi':
+                decoder = SPIDecoder(vcd, signals)
+            else:
+                raise SkillError(
+                    'INVALID_PROTOCOL',
+                    'Unsupported protocol: {}'.format(protocol),
+                    {'supported': ['axi4', 'apb', 'uart', 'spi']})
+        except ValueError as e:
+            # Decoders raise ValueError when signal pattern matches nothing.
+            raise SkillError('SIGNAL_NOT_FOUND', str(e),
+                              {'pattern': signals})
 
-    # Decode
-    transactions, violations, statistics = decoder.decode(t0, t1)
+        # Decode
+        transactions, violations, statistics = decoder.decode(t0, t1)
 
-    # Format transactions for output (protocol-specific)
-    formatted_txns = _format_transactions(transactions, protocol, ts)
+        # Format transactions for output (protocol-specific)
+        formatted_txns = _format_transactions(transactions, protocol, ts)
 
-    # Generate suggestions
-    suggestions = _generate_suggestions(transactions, violations, statistics, protocol)
+        # Generate suggestions
+        suggestions = _generate_suggestions(transactions, violations, statistics, protocol)
 
-    # Output
-    result = {
-        'status': 'success',
-        'skill': 'protocol_decode',
-        'input': {
+        # Build standardized envelope
+        signals_matched = len(decoder.signal_map) if hasattr(decoder, 'signal_map') else 0
+        input_dict = {
             'file': vcd.path,
             'protocol': protocol,
             'signals': signals,
             'time_range': [fmt_time(t0, ts), fmt_time(t1, ts) if t1 else 'end']
-        },
-        'result': {
+        }
+        result = {
             'transactions': formatted_txns,
             'violations': violations,
-            'statistics': statistics
-        },
-        'suggestions': suggestions
-    }
+            'statistics': statistics,
+        }
+        metadata = _build_metadata(vcd, t0, t1, signals_matched=signals_matched)
 
-    if args.json:
-        _json(result)
-    else:
-        _print_protocol_result(result, protocol, statistics, formatted_txns, violations, suggestions, ts)
+        envelope = _skill_envelope(
+            'protocol_decode', started_at, input_dict, result, metadata, suggestions)
+
+        if getattr(args, 'json', False):
+            _json(envelope)
+        else:
+            _print_protocol_result(envelope, protocol, statistics, formatted_txns,
+                                    violations, suggestions, ts)
+        return envelope
+
+    return run_skill('protocol_decode', args, _run)
 
 
 def _format_transactions(transactions, protocol, ts):
@@ -3366,91 +3531,100 @@ class FSMTracer:
 
 def cmd_fsm_trace(vcd, args):
     """FSM trace command handler"""
-    ts = vcd.ts_sec
-    t0 = parse_time(args.begin, ts) if args.begin else 0
-    t1 = parse_time(args.end, ts) if args.end else None
+    def _run(args, started_at):
+        ts = vcd.ts_sec
+        try:
+            t0 = parse_time(args.begin, ts) if args.begin else 0
+            t1 = parse_time(args.end, ts) if args.end else None
+            stuck_threshold = parse_time(args.stuck_threshold, ts) if args.stuck_threshold else 100000  # 100us
+        except _TimeParseError as e:
+            raise SkillError('INVALID_TIME_RANGE', str(e))
 
-    state_signal = args.state
-    stuck_threshold = parse_time(args.stuck_threshold, ts) if args.stuck_threshold else 100000  # 100us
+        state_signal = args.state
 
-    # Create tracer
-    tracer = FSMTracer(vcd, state_signal)
+        # Create tracer
+        try:
+            tracer = FSMTracer(vcd, state_signal)
+        except ValueError as e:
+            raise SkillError('SIGNAL_NOT_FOUND', str(e),
+                              {'pattern': state_signal})
 
-    # Trace
-    transitions, anomalies, statistics = tracer.trace(t0, t1, stuck_threshold)
+        # Trace
+        transitions, anomalies, statistics = tracer.trace(t0, t1, stuck_threshold)
 
-    # Format transitions for output
-    formatted_trans = []
-    for i, trans in enumerate(transitions):
-        formatted = {
-            'id': i,
-            'from': trans['from'],
-            'to': trans['to'],
-            'time': trans['time'],
-            'time_ticks': trans['time_ticks'],
-            'duration_in_from': fmt_time(trans['duration_in_from'], ts),
-            'duration_in_from_ticks': trans['duration_in_from_ticks']
-        }
-        formatted_trans.append(formatted)
+        # Format transitions for output
+        formatted_trans = []
+        for i, trans in enumerate(transitions):
+            formatted = {
+                'id': i,
+                'from': trans['from'],
+                'to': trans['to'],
+                'time': trans['time'],
+                'time_ticks': trans['time_ticks'],
+                'duration_in_from': fmt_time(trans['duration_in_from'], ts),
+                'duration_in_from_ticks': trans['duration_in_from_ticks']
+            }
+            formatted_trans.append(formatted)
 
-    # Generate suggestions
-    suggestions = []
-    if anomalies:
-        suggestions.append(f"Found {len(anomalies)} anomaly(ies)")
-        for anom in anomalies[:3]:  # Show first 3
-            suggestions.append(f"State {anom['state']} stuck for {anom['duration']}")
+        # Generate suggestions
+        suggestions = []
+        if anomalies:
+            suggestions.append(f"Found {len(anomalies)} anomaly(ies)")
+            for anom in anomalies[:3]:  # Show first 3
+                suggestions.append(f"State {anom['state']} stuck for {anom['duration']}")
 
-    if statistics['total_transitions'] == 0:
-        suggestions.append("No state transitions found in specified time range")
+        if statistics['total_transitions'] == 0:
+            suggestions.append("No state transitions found in specified time range")
 
-    # Output
-    result = {
-        'status': 'success',
-        'skill': 'fsm_trace',
-        'input': {
+        # Build envelope
+        input_dict = {
             'file': vcd.path,
             'state_signal': state_signal,
             'time_range': [fmt_time(t0, ts), fmt_time(t1, ts) if t1 else 'end'],
-            'stuck_threshold': fmt_time(stuck_threshold, ts)
-        },
-        'result': {
+            'stuck_threshold': fmt_time(stuck_threshold, ts),
+        }
+        result = {
             'transitions': formatted_trans,
             'anomalies': anomalies,
-            'statistics': statistics
-        },
-        'suggestions': suggestions
-    }
+            'statistics': statistics,
+        }
+        metadata = _build_metadata(vcd, t0, t1, signals_matched=1)
+        envelope = _skill_envelope(
+            'fsm_trace', started_at, input_dict, result, metadata, suggestions)
 
-    if args.json:
-        _json(result)
-    else:
-        # Text output
-        print(f"State Signal: {tracer.state_path}")
-        print(f"Time range: {result['input']['time_range'][0]} ~ {result['input']['time_range'][1]}")
-        print(f"\nTransitions: {statistics['total_transitions']}")
-        print(f"Unique States: {statistics['unique_states']}")
+        if getattr(args, 'json', False):
+            _json(envelope)
+        else:
+            # Text output
+            print(f"State Signal: {tracer.state_path}")
+            print(f"Time range: {input_dict['time_range'][0]} ~ {input_dict['time_range'][1]}")
+            print(f"\nTransitions: {statistics['total_transitions']}")
+            print(f"Unique States: {statistics['unique_states']}")
 
-        if statistics['states']:
-            print("\nState Statistics:")
-            for st in statistics['states']:
-                print(f"  {st['state']}: {st['occurrences']} times, avg {st['avg_time']}, total {st['total_time']}")
+            if statistics['states']:
+                print("\nState Statistics:")
+                for st in statistics['states']:
+                    print(f"  {st['state']}: {st['occurrences']} times, avg {st['avg_time']}, total {st['total_time']}")
 
-        if formatted_trans and not args.json:
-            print(f"\nTransition Details (showing first 20):")
-            for trans in formatted_trans[:20]:
-                print(f"  [{trans['id']}] {trans['from']} -> {trans['to']} @ {trans['time']} (held {trans['duration_in_from']})")
-            if len(formatted_trans) > 20:
-                print(f"  ... and {len(formatted_trans) - 20} more")
+            if formatted_trans:
+                print(f"\nTransition Details (showing first 20):")
+                for trans in formatted_trans[:20]:
+                    print(f"  [{trans['id']}] {trans['from']} -> {trans['to']} @ {trans['time']} (held {trans['duration_in_from']})")
+                if len(formatted_trans) > 20:
+                    print(f"  ... and {len(formatted_trans) - 20} more")
 
-        if anomalies:
-            print(f"\nAnomalies: {len(anomalies)}")
-            for anom in anomalies:
-                print(f"  [{anom['severity'].upper()}] {anom['time']}: {anom['description']}")
+            if anomalies:
+                print(f"\nAnomalies: {len(anomalies)}")
+                for anom in anomalies:
+                    print(f"  [{anom['severity'].upper()}] {anom['time']}: {anom['description']}")
 
-        if suggestions:
-            print(f"\nSuggestions:")
-            for s in suggestions:
-                print(f"  - {s}")
+            if suggestions:
+                print(f"\nSuggestions:")
+                for s in suggestions:
+                    print(f"  - {s}")
+        return envelope
+
+    return run_skill('fsm_trace', args, _run)
 
 
 # -- Causality Analysis ------------------------------------------------------
@@ -3699,104 +3873,113 @@ class CausalityAnalyzer:
 
 def cmd_causality(vcd, args):
     """Causality analysis command handler"""
-    ts = vcd.ts_sec
+    def _run(args, started_at):
+        ts = vcd.ts_sec
 
-    # Parse effect time
-    effect_time = parse_time(args.at, ts)
+        # Parse effect time and window
+        try:
+            effect_time = parse_time(args.at, ts)
+            if args.window:
+                window = parse_time(args.window, ts)
+            else:
+                window = parse_time('100ns', ts)
+        except _TimeParseError as e:
+            raise SkillError('INVALID_TIME_RANGE', str(e))
 
-    # Parse search window (default: 100ns)
-    if args.window:
-        window = parse_time(args.window, ts)
-    else:
-        window = parse_time('100ns', ts)
+        # Create analyzer
+        analyzer = CausalityAnalyzer(vcd)
 
-    # Create analyzer
-    analyzer = CausalityAnalyzer(vcd)
+        # Analyze
+        try:
+            effect_info, candidates, causal_chain = analyzer.analyze(
+                args.effect, effect_time, window)
+        except ValueError as e:
+            raise SkillError('SIGNAL_NOT_FOUND', str(e),
+                              {'pattern': args.effect})
 
-    # Analyze
-    effect_info, candidates, causal_chain = analyzer.analyze(
-        args.effect, effect_time, window)
+        # Generate suggestions
+        suggestions = []
+        if candidates:
+            top = candidates[0]
+            if top['correlation'] >= 0.7:
+                suggestions.append(
+                    f"High correlation with {top['signal']} ({top['correlation']:.0%}), "
+                    f"likely root cause"
+                )
+            elif top['correlation'] >= 0.4:
+                suggestions.append(
+                    f"Moderate correlation with {top['signal']} ({top['correlation']:.0%}), "
+                    f"investigate further"
+                )
+            else:
+                suggestions.append(
+                    f"Weak correlation with top candidate {top['signal']} "
+                    f"({top['correlation']:.0%}), consider expanding search window"
+                )
 
-    # Generate suggestions
-    suggestions = []
-    if candidates:
-        top = candidates[0]
-        if top['correlation'] >= 0.7:
-            suggestions.append(
-                f"High correlation with {top['signal']} ({top['correlation']:.0%}), "
-                f"likely root cause"
-            )
-        elif top['correlation'] >= 0.4:
-            suggestions.append(
-                f"Moderate correlation with {top['signal']} ({top['correlation']:.0%}), "
-                f"investigate further"
-            )
+            if len(candidates) > 1:
+                suggestions.append(
+                    f"Found {len(candidates)} potential causes; "
+                    f"check causal_chain for temporal ordering"
+                )
         else:
             suggestions.append(
-                f"Weak correlation with top candidate {top['signal']} "
-                f"({top['correlation']:.0%}), consider expanding search window"
+                "No correlated signals found in search window; "
+                "try expanding --window or check for spontaneous events"
             )
 
-        if len(candidates) > 1:
-            suggestions.append(
-                f"Found {len(candidates)} potential causes; "
-                f"check causal_chain for temporal ordering"
-            )
-    else:
-        suggestions.append(
-            "No correlated signals found in search window; "
-            "try expanding --window or check for spontaneous events"
-        )
-
-    # Build result
-    result = {
-        'status': 'success',
-        'skill': 'causality',
-        'input': {
+        # Build envelope
+        input_dict = {
             'file': vcd.path,
             'effect_signal': args.effect,
             'effect_time': fmt_time(effect_time, ts),
             'effect_time_ticks': effect_time,
             'search_window': fmt_time(window, ts),
-            'search_window_ticks': window
-        },
-        'result': {
+            'search_window_ticks': window,
+        }
+        result = {
             'effect': effect_info,
             'potential_causes': candidates,
-            'causal_chain': causal_chain
-        },
-        'suggestions': suggestions
-    }
+            'causal_chain': causal_chain,
+        }
+        metadata = _build_metadata(
+            vcd, max(0, effect_time - window), effect_time,
+            signals_matched=len(candidates))
+        envelope = _skill_envelope(
+            'causality', started_at, input_dict, result, metadata, suggestions)
 
-    if args.json:
-        _json(result)
-    else:
-        # Text output
-        print(f"Effect Signal: {effect_info['signal']}")
-        print(f"Effect Time:   {effect_info['time']} (value={effect_info['value']})")
-        print(f"Search Window: {fmt_time(window, ts)} before effect")
-
-        if candidates:
-            print(f"\nPotential Causes: {len(candidates)} found")
-            print(f"  {'#':<3} {'Signal':<50} {'Delta':<10} {'Value':<10} {'Corr':<8} {'Confidence'}")
-            for i, c in enumerate(candidates[:10]):
-                print(f"  {i:<3} {c['signal']:<50} {c['delta']:<10} {str(c['value']):<10} "
-                      f"{c['correlation']:<8} {c['confidence']}")
-            if len(candidates) > 10:
-                print(f"  ... and {len(candidates) - 10} more")
+        if getattr(args, 'json', False):
+            _json(envelope)
         else:
-            print("\nNo correlated signals found in search window.")
+            # Text output
+            print(f"Effect Signal: {effect_info['signal']}")
+            print(f"Effect Time:   {effect_info['time']} (value={effect_info['value']})")
+            print(f"Search Window: {fmt_time(window, ts)} before effect")
 
-        if causal_chain:
-            print(f"\nCausal Chain (chronological):")
-            for entry in causal_chain:
-                marker = " <-- EFFECT" if entry['signal'] == effect_info['signal'] else ""
-                print(f"  {entry['time']:<12} {entry['signal']:<50} = {entry['value']}{marker}")
+            if candidates:
+                print(f"\nPotential Causes: {len(candidates)} found")
+                print(f"  {'#':<3} {'Signal':<50} {'Delta':<10} {'Value':<10} {'Corr':<8} {'Confidence'}")
+                for i, c in enumerate(candidates[:10]):
+                    print(f"  {i:<3} {c['signal']:<50} {c['delta']:<10} {str(c['value']):<10} "
+                          f"{c['correlation']:<8} {c['confidence']}")
+                if len(candidates) > 10:
+                    print(f"  ... and {len(candidates) - 10} more")
+            else:
+                print("\nNo correlated signals found in search window.")
 
-        if suggestions:
-            print(f"\nSuggestions:")
-            for s in suggestions:
-                print(f"  - {s}")
+            if causal_chain:
+                print(f"\nCausal Chain (chronological):")
+                for entry in causal_chain:
+                    marker = " <-- EFFECT" if entry['signal'] == effect_info['signal'] else ""
+                    print(f"  {entry['time']:<12} {entry['signal']:<50} = {entry['value']}{marker}")
+
+            if suggestions:
+                print(f"\nSuggestions:")
+                for s in suggestions:
+                    print(f"  - {s}")
+        return envelope
+
+    return run_skill('causality', args, _run)
 
 
 # -- Anomaly Detection -------------------------------------------------------
@@ -4078,119 +4261,128 @@ class AnomalyDetector:
 
 def cmd_anomaly_detect(vcd, args):
     """Anomaly detection command handler"""
-    ts = vcd.ts_sec
-    t0 = parse_time(args.begin, ts) if args.begin else 0
-    t1 = parse_time(args.end, ts) if args.end else None
+    def _run(args, started_at):
+        ts = vcd.ts_sec
+        try:
+            t0 = parse_time(args.begin, ts) if args.begin else 0
+            t1 = parse_time(args.end, ts) if args.end else None
 
-    # Determine which signals to check
-    sids = vcd.match(args.filter)
+            # Parse thresholds
+            stuck_threshold = None
+            if args.stuck_threshold:
+                stuck_threshold = parse_time(args.stuck_threshold, ts)
 
-    # Parse thresholds
-    stuck_threshold = None
-    if args.stuck_threshold:
-        stuck_threshold = parse_time(args.stuck_threshold, ts)
+            glitch_threshold = None
+            if args.glitch_threshold:
+                glitch_threshold = parse_time(args.glitch_threshold, ts)
+        except _TimeParseError as e:
+            raise SkillError('INVALID_TIME_RANGE', str(e))
 
-    glitch_threshold = None
-    if args.glitch_threshold:
-        glitch_threshold = parse_time(args.glitch_threshold, ts)
+        # Determine which signals to check
+        try:
+            sids = vcd.match(args.filter)
+        except _FilterParseError as e:
+            raise SkillError('INVALID_ARGUMENT',
+                              'invalid --filter pattern: {}'.format(e))
 
-    # Run detection
-    detector = AnomalyDetector(vcd)
-    anomalies, summary = detector.detect(
-        t0, t1, sids=sids,
-        stuck_threshold=stuck_threshold,
-        glitch_threshold=glitch_threshold)
+        # Run detection
+        detector = AnomalyDetector(vcd)
+        anomalies, summary = detector.detect(
+            t0, t1, sids=sids,
+            stuck_threshold=stuck_threshold,
+            glitch_threshold=glitch_threshold)
 
-    # Generate suggestions
-    suggestions = []
-    if summary['critical'] > 0:
-        suggestions.append(
-            f"Critical: {summary['critical']} critical anomaly(ies) found, "
-            f"investigate immediately"
-        )
-    if summary['by_type'].get('metastability', 0) > 0:
-        suggestions.append(
-            f"{summary['by_type']['metastability']} metastability issue(s); "
-            f"review CDC (Clock Domain Crossing) design"
-        )
-    if summary['by_type'].get('bus_contention', 0) > 0:
-        suggestions.append(
-            f"{summary['by_type']['bus_contention']} bus contention(s); "
-            f"check for multiple drivers"
-        )
-    if summary['by_type'].get('glitch', 0) > 0:
-        suggestions.append(
-            f"{summary['by_type']['glitch']} glitch(es); "
-            f"check pulse width requirements"
-        )
-    if summary['by_type'].get('stuck_signal', 0) > 0:
-        suggestions.append(
-            f"{summary['by_type']['stuck_signal']} stuck signal(s); "
-            f"verify expected activity"
-        )
-    if summary['total_anomalies'] == 0:
-        suggestions.append("No anomalies detected; waveform appears clean")
+        # Generate suggestions
+        suggestions = []
+        if summary['critical'] > 0:
+            suggestions.append(
+                f"Critical: {summary['critical']} critical anomaly(ies) found, "
+                f"investigate immediately"
+            )
+        if summary['by_type'].get('metastability', 0) > 0:
+            suggestions.append(
+                f"{summary['by_type']['metastability']} metastability issue(s); "
+                f"review CDC (Clock Domain Crossing) design"
+            )
+        if summary['by_type'].get('bus_contention', 0) > 0:
+            suggestions.append(
+                f"{summary['by_type']['bus_contention']} bus contention(s); "
+                f"check for multiple drivers"
+            )
+        if summary['by_type'].get('glitch', 0) > 0:
+            suggestions.append(
+                f"{summary['by_type']['glitch']} glitch(es); "
+                f"check pulse width requirements"
+            )
+        if summary['by_type'].get('stuck_signal', 0) > 0:
+            suggestions.append(
+                f"{summary['by_type']['stuck_signal']} stuck signal(s); "
+                f"verify expected activity"
+            )
+        if summary['total_anomalies'] == 0:
+            suggestions.append("No anomalies detected; waveform appears clean")
 
-    # Compute defaults used (for transparency)
-    if t1 is None:
-        t1 = vcd.scan_time_range()[1] or 0
-    if stuck_threshold is None:
-        stuck_threshold = max((t1 - t0) // 2, int(100e-6 / ts))
-    if glitch_threshold is None:
-        glitch_threshold = int(5e-9 / ts)
+        # Compute defaults used (for transparency in input echo)
+        if t1 is None:
+            t1 = vcd.scan_time_range()[1] or 0
+        if stuck_threshold is None:
+            stuck_threshold = max((t1 - t0) // 2, int(100e-6 / ts))
+        if glitch_threshold is None:
+            glitch_threshold = int(5e-9 / ts)
 
-    # Build result
-    result = {
-        'status': 'success',
-        'skill': 'anomaly_detect',
-        'input': {
+        signals_analyzed = len(sids) if sids is not None else len(vcd.signals)
+        input_dict = {
             'file': vcd.path,
             'time_range': [fmt_time(t0, ts), fmt_time(t1, ts) if t1 else 'end'],
-            'signals_analyzed': len(sids) if sids is not None else len(vcd.signals),
+            'signals_analyzed': signals_analyzed,
             'stuck_threshold': fmt_time(stuck_threshold, ts),
-            'glitch_threshold': fmt_time(glitch_threshold, ts)
-        },
-        'result': {
+            'glitch_threshold': fmt_time(glitch_threshold, ts),
+        }
+        result = {
             'anomalies': anomalies,
-            'summary': summary
-        },
-        'suggestions': suggestions
-    }
+            'summary': summary,
+        }
+        metadata = _build_metadata(vcd, t0, t1, signals_matched=signals_analyzed)
+        envelope = _skill_envelope(
+            'anomaly_detect', started_at, input_dict, result, metadata, suggestions)
 
-    if args.json:
-        _json(result)
-    else:
-        # Text output
-        print(f"Anomaly Detection Report")
-        print(f"Time range: {result['input']['time_range'][0]} ~ {result['input']['time_range'][1]}")
-        print(f"Signals analyzed: {result['input']['signals_analyzed']}")
-        print(f"Thresholds: stuck >= {result['input']['stuck_threshold']}, "
-              f"glitch < {result['input']['glitch_threshold']}")
+        if getattr(args, 'json', False):
+            _json(envelope)
+        else:
+            # Text output
+            print(f"Anomaly Detection Report")
+            print(f"Time range: {input_dict['time_range'][0]} ~ {input_dict['time_range'][1]}")
+            print(f"Signals analyzed: {input_dict['signals_analyzed']}")
+            print(f"Thresholds: stuck >= {input_dict['stuck_threshold']}, "
+                  f"glitch < {input_dict['glitch_threshold']}")
 
-        print(f"\nSummary:")
-        print(f"  Total anomalies: {summary['total_anomalies']}")
-        print(f"  Critical: {summary['critical']}")
-        print(f"  Error:    {summary['error']}")
-        print(f"  Warning:  {summary['warning']}")
+            print(f"\nSummary:")
+            print(f"  Total anomalies: {summary['total_anomalies']}")
+            print(f"  Critical: {summary['critical']}")
+            print(f"  Error:    {summary['error']}")
+            print(f"  Warning:  {summary['warning']}")
 
-        if summary['by_type']:
-            print(f"\nBy type:")
-            for anom_type, count in sorted(summary['by_type'].items()):
-                print(f"  {anom_type}: {count}")
+            if summary['by_type']:
+                print(f"\nBy type:")
+                for anom_type, count in sorted(summary['by_type'].items()):
+                    print(f"  {anom_type}: {count}")
 
-        if anomalies:
-            print(f"\nAnomalies (showing first 20):")
-            for a in anomalies[:20]:
-                sev = a.get('severity', 'warning').upper()
-                print(f"  [{sev:<8}] {a['time']:<12} {a['type']:<18} {a['signal']}")
-                print(f"             {a['description']}")
-            if len(anomalies) > 20:
-                print(f"  ... and {len(anomalies) - 20} more")
+            if anomalies:
+                print(f"\nAnomalies (showing first 20):")
+                for a in anomalies[:20]:
+                    sev = a.get('severity', 'warning').upper()
+                    print(f"  [{sev:<8}] {a['time']:<12} {a['type']:<18} {a['signal']}")
+                    print(f"             {a['description']}")
+                if len(anomalies) > 20:
+                    print(f"  ... and {len(anomalies) - 20} more")
 
-        if suggestions:
-            print(f"\nSuggestions:")
-            for s in suggestions:
-                print(f"  - {s}")
+            if suggestions:
+                print(f"\nSuggestions:")
+                for s in suggestions:
+                    print(f"  - {s}")
+        return envelope
+
+    return run_skill('anomaly_detect', args, _run)
 
 
 # -- CLI entry ---------------------------------------------------------------
@@ -4219,6 +4411,41 @@ def _add_common(sp):
                     help='show extra fields; if --limit is omitted, disables truncation')
 
 
+def _load_skill_manifest():
+    """Load vcd_skill_manifest.json from the package directory."""
+    manifest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'vcd_skill_manifest.json')
+    if not os.path.isfile(manifest_path):
+        sys.exit('Error: skill manifest not found at {}'.format(manifest_path))
+    try:
+        with open(manifest_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        sys.exit('Error: cannot load skill manifest: {}'.format(e))
+
+
+def _handle_skill_manifest(args):
+    """Handle --skill-manifest / --skill-info <name>.
+
+    --skill-manifest dumps the entire manifest as JSON.
+    --skill-info <name> dumps just one capability block, or exits non-zero
+    if the requested skill is not in the manifest.
+    """
+    manifest = _load_skill_manifest()
+
+    if args.skill_info:
+        target = args.skill_info
+        for cap in manifest.get('capabilities', []):
+            if cap.get('skill') == target or cap.get('command') == target:
+                _json(cap)
+                return
+        sys.exit("Error: unknown skill '{}'; known: {}".format(
+            target, ', '.join(c['skill'] for c in manifest.get('capabilities', []))))
+
+    # Default: print the whole manifest
+    _json(manifest)
+
+
 def main():
     p = argparse.ArgumentParser(
         prog='vcd_analyzer',
@@ -4231,6 +4458,15 @@ def main():
     p.add_argument('--verbose', action='store_true',
                    help='show extra fields; if --limit is omitted, disables truncation')
     p.add_argument('--version', action='version', version='%(prog)s ' + __version__)
+
+    # Skill discovery: --skill-manifest dumps the full manifest as JSON,
+    # --skill-info <name> dumps just one skill's entry. These exit before
+    # subcommand parsing so they don't conflict with normal usage.
+    p.add_argument('--skill-manifest', action='store_true',
+                   help='print the Skill manifest (vcd_skill_manifest.json) and exit')
+    p.add_argument('--skill-info', metavar='NAME',
+                   help='print one Skill capability entry by name and exit (e.g. protocol_decode)')
+
     sub = p.add_subparsers(dest='cmd', metavar='<command>')
 
     sp = sub.add_parser('info', help='file overview: timescale, signal count, time span, scopes')
@@ -4299,6 +4535,12 @@ def main():
     _add_time_args(sp); _add_filter(sp); _add_common(sp)
 
     args = p.parse_args()
+
+    # Skill manifest discovery (exits before subcommand dispatch)
+    if args.skill_manifest or args.skill_info:
+        _handle_skill_manifest(args)
+        return
+
     if not args.cmd:
         p.print_help()
         sys.exit(1)

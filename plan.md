@@ -1,8 +1,8 @@
 # VCD Analyzer - AI Agent Skill Interface 升级计划
 
-## Phase 1 完成状态总结 (2026-05-26)
+## Phase 1 + Phase 2 完成状态总结 (2026-05-27)
 
-**所有 4 个核心 Skill 已实现并通过测试**：
+**所有 4 个核心 Skill 已实现并通过测试 + Phase 2 标准化接口已上线**：
 
 | Skill | 命令 | 状态 | 测试数 |
 |-------|------|------|--------|
@@ -14,10 +14,19 @@
 | Causality Analysis | `causality` | ✅ 完成 | 7 |
 | Anomaly Detection | `anomaly-detect` | ✅ 完成 | 10 |
 | 通用 protocol-decode | (含错误处理) | ✅ 完成 | 2 |
+| **Skill Envelope / Manifest / Error** | `--skill-manifest`, `--skill-info`, 标准化 envelope | ✅ 完成 | 12 |
 
-**总测试数**：33 个 Skill 测试 + 36 个核心测试 = **69 个测试，全部通过**
+**总测试数**：45 个 Skill 测试 + 36 个核心测试 = **81 个测试，全部通过**
+（pytest 收集总数 86 个，含 external sample 测试）
+
+**Phase 2 新增能力**:
+- 统一 JSON envelope（`status` / `skill` / `execution_time_ms` / `input` / `result` / `metadata` / `suggestions`）
+- 结构化错误（9 类标准错误码 + `details` 字典）
+- Skill manifest 自描述（`--skill-manifest`、`--skill-info <name>`）
+- 错误退出码 != 0（Agent 可不解析 JSON 即可检测失败）
 
 **CI 集成**：GitHub Actions 矩阵测试（Ubuntu/Windows/macOS × Python 3.9-3.12）
++ Skill manifest CLI 验证步骤
 
 ---
 
@@ -1421,21 +1430,43 @@ Agent: 我来分析一下...
 ### Phase 2 详细计划（2-3 周）
 
 #### Week 1: 统一 JSON 格式
-- [ ] 定义标准响应结构
-- [ ] 重构所有 Skill 输出
-- [ ] 添加 `suggestions` 字段生成逻辑
-- [ ] 错误处理标准化
+- [x] 定义标准响应结构（envelope: status / skill / execution_time_ms / input / result / metadata / suggestions）
+- [x] 重构所有 Skill 输出（cmd_protocol_decode / cmd_fsm_trace / cmd_causality / cmd_anomaly_detect）
+- [x] 添加 `suggestions` 字段生成逻辑（每个 Skill 都有 Agent-facing 提示）
+- [x] 错误处理标准化（SkillError + run_skill() 包装器，9 类错误码）
 
 #### Week 2: Manifest 系统
-- [ ] 创建 `vcd_skill_manifest.json`
-- [ ] 实现 `--skill-manifest` 命令
-- [ ] 实现 `--skill-info <name>` 命令
-- [ ] JSON Schema 验证
+- [x] 创建 `vcd_skill_manifest.json`（4 个 Skill 完整 schema + 错误码列表）
+- [x] 实现 `--skill-manifest` 命令
+- [x] 实现 `--skill-info <name>` 命令
+- [x] JSON Schema 验证（capabilities 字段中包含 input_schema / result_schema）
 
 #### Week 3: 测试和优化
-- [ ] 端到端测试
-- [ ] 性能优化
-- [ ] 错误处理完善
+- [x] 端到端测试（verify/test_skill_envelope.py，12 个测试）
+- [x] CI 集成（新增 envelope 测试步骤 + manifest 命令验证）
+- [x] 错误处理完善（4 类常见错误的结构化路径全覆盖）
+- [x] 文档（docs/skill_envelope.md）
+
+**完成日期**: 2026-05-27
+
+**实现亮点**:
+- **新增统一框架**：`SkillError` 异常 + `run_skill()` 包装器 + `_skill_envelope()` / `_skill_error_envelope()` 构建器
+- **9 类标准错误码**：`FILE_NOT_FOUND` / `PARSE_ERROR` / `INVALID_PROTOCOL` / `SIGNAL_NOT_FOUND` / `INVALID_TIME_RANGE` / `INVALID_ARGUMENT` / `INSUFFICIENT_DATA` / `RESOURCE_LIMIT` / `INTERNAL_ERROR`
+- **向后兼容**：所有原有的 `result.transactions` / `input.protocol` 等字段保持不变，新增字段（`metadata` / `execution_time_ms`）层叠在外
+- **manifest 自描述**：Agent 无需任何先验知识就能通过 `--skill-manifest` 发现工具能力
+- **示例输入回显**：`input` 字段重述每次调用的参数，方便日志审计和重放
+
+**Phase 2 完成标准**:
+- [x] 所有 Skill 输出统一 JSON 格式
+- [x] `--skill-manifest` 命令可用
+- [x] 错误处理完善（结构化 error 对象 + 退出码 != 0）
+
+**测试覆盖**:
+- 4 个 Skill envelope shape 验证
+- 4 类错误码路径验证（INVALID_PROTOCOL / SIGNAL_NOT_FOUND × 2 / INVALID_TIME_RANGE）
+- 4 个 `--skill-info` 查询验证
+- manifest 错误码与实现一致性验证
+- 总计 12 个新测试，全部通过
 
 ### Phase 3 详细计划（1 月）
 
@@ -1806,9 +1837,9 @@ def test_debug_axi_timeout():
 - [x] CI 集成（GitHub Actions multi-OS multi-Python 矩阵测试）
 
 ### Phase 2 完成标准
-- [ ] 所有 Skill 输出统一 JSON 格式
-- [ ] `--skill-manifest` 命令可用
-- [ ] 错误处理完善
+- [x] 所有 Skill 输出统一 JSON 格式
+- [x] `--skill-manifest` 命令可用
+- [x] 错误处理完善
 
 ### Phase 3 完成标准
 - [ ] 至少 2 个 Agent 适配器可用（MCP + OpenAI）

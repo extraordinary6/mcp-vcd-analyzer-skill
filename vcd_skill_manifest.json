@@ -1,0 +1,137 @@
+{
+  "name": "vcd_analyzer",
+  "version": "2.0.0",
+  "description": "VCD waveform analysis toolkit exposed as AI Agent Skills. Each Skill emits a standardized JSON envelope ({status, skill, execution_time_ms, input, result, metadata, suggestions}) so any LLM-based Agent (Claude Code, GPT-4 function calling, LangChain, MCP) can call it the same way.",
+  "envelope": {
+    "success": {
+      "status": "success",
+      "skill": "<name>",
+      "execution_time_ms": "int",
+      "input": "echo of inputs",
+      "result": "skill-specific result payload",
+      "metadata": {
+        "vcd_file_size": "int (bytes)",
+        "analyzer_version": "string",
+        "signals_matched": "int",
+        "time_range_analyzed": "[start, end]"
+      },
+      "suggestions": "string[] — next-step guidance for the Agent"
+    },
+    "error": {
+      "status": "error",
+      "skill": "<name>",
+      "execution_time_ms": "int",
+      "input": "echo of inputs",
+      "error": {
+        "code": "one of FILE_NOT_FOUND | PARSE_ERROR | INVALID_PROTOCOL | SIGNAL_NOT_FOUND | INVALID_TIME_RANGE | INVALID_ARGUMENT | INSUFFICIENT_DATA | RESOURCE_LIMIT | INTERNAL_ERROR",
+        "message": "human-readable summary",
+        "details": "diagnostic dict (e.g. supported alternatives, available signals)"
+      },
+      "suggestions": []
+    }
+  },
+  "error_codes": [
+    {"code": "FILE_NOT_FOUND", "description": "VCD file does not exist or cannot be opened"},
+    {"code": "PARSE_ERROR", "description": "VCD file format is invalid or corrupt"},
+    {"code": "INVALID_PROTOCOL", "description": "Requested protocol is not supported"},
+    {"code": "SIGNAL_NOT_FOUND", "description": "Signal pattern matched zero or multiple signals when one was required"},
+    {"code": "INVALID_TIME_RANGE", "description": "Time argument failed to parse or end < begin"},
+    {"code": "INVALID_ARGUMENT", "description": "A CLI argument is malformed (filter pattern, condition, etc.)"},
+    {"code": "INSUFFICIENT_DATA", "description": "The VCD does not have enough events to complete the analysis"},
+    {"code": "RESOURCE_LIMIT", "description": "Input exceeds configured resource limits"},
+    {"code": "INTERNAL_ERROR", "description": "Unhandled exception inside the Skill — please report"}
+  ],
+  "capabilities": [
+    {
+      "skill": "protocol_decode",
+      "command": "protocol-decode",
+      "description": "Decode bus protocol transactions (AXI4 / APB / UART / SPI). Returns transactions, protocol violations, and performance statistics.",
+      "category": "protocol_analysis",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":     {"type": "string", "description": "Path to VCD file"},
+          "protocol": {"type": "string", "enum": ["axi4", "apb", "uart", "spi"]},
+          "signals":  {"type": "string", "description": "Comma-separated signal patterns (substring or glob)"},
+          "begin":    {"type": "string", "description": "Start time (e.g. 100ns, 17.5us)"},
+          "end":      {"type": "string", "description": "End time (same format as begin)"}
+        },
+        "required": ["file", "protocol"]
+      },
+      "result_schema": {
+        "transactions": "array of decoded transactions (fields vary by protocol)",
+        "violations": "array of protocol violations",
+        "statistics": "summary stats (counts, latency, bandwidth, baud, etc.)"
+      },
+      "example_cli": "python vcd_analyzer.py protocol-decode sim.vcd --protocol axi4 --signals \"m_axi_*\" --json"
+    },
+    {
+      "skill": "fsm_trace",
+      "command": "fsm-trace",
+      "description": "Extract state machine transitions from a state signal. Detects stuck states and provides per-state duration statistics.",
+      "category": "behavioral_analysis",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":             {"type": "string"},
+          "state":            {"type": "string", "description": "Signal pattern that must resolve to exactly one signal"},
+          "stuck_threshold":  {"type": "string", "description": "Duration above which a state is reported stuck (default 100us)"},
+          "begin":            {"type": "string"},
+          "end":              {"type": "string"}
+        },
+        "required": ["file", "state"]
+      },
+      "result_schema": {
+        "transitions": "array of {from, to, time, duration_in_from}",
+        "anomalies": "array of detected anomalies (stuck_state, ...)",
+        "statistics": "per-state occurrence counts and durations"
+      },
+      "example_cli": "python vcd_analyzer.py fsm-trace sim.vcd --state fsm_state --json"
+    },
+    {
+      "skill": "causality",
+      "command": "causality",
+      "description": "Find potential causes for a signal change at a specific time. Ranks candidates by temporal proximity (40%) and historical correlation (60%); automatically filters clock-like signals.",
+      "category": "root_cause_analysis",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":   {"type": "string"},
+          "effect": {"type": "string", "description": "Effect signal pattern (must resolve to exactly one signal)"},
+          "at":     {"type": "string", "description": "Time when the effect was observed"},
+          "window": {"type": "string", "description": "Search window before --at (default 100ns)"}
+        },
+        "required": ["file", "effect", "at"]
+      },
+      "result_schema": {
+        "effect": "info about the effect signal and value",
+        "potential_causes": "array of candidate causes with correlation/confidence",
+        "causal_chain": "candidates plus effect arranged chronologically"
+      },
+      "example_cli": "python vcd_analyzer.py causality sim.vcd --effect error_flag --at 17.5us --json"
+    },
+    {
+      "skill": "anomaly_detect",
+      "command": "anomaly-detect",
+      "description": "Detect common waveform anomalies: stuck signals, glitches, metastability, bus contention. Severity-classified output suitable for triage.",
+      "category": "quality_check",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":             {"type": "string"},
+          "filter":           {"type": "string", "description": "Restrict analysis to matching signals"},
+          "begin":            {"type": "string"},
+          "end":              {"type": "string"},
+          "stuck_threshold":  {"type": "string", "description": "Default: 50% of window or 100us"},
+          "glitch_threshold": {"type": "string", "description": "Default: 5ns"}
+        },
+        "required": ["file"]
+      },
+      "result_schema": {
+        "anomalies": "array of {type, signal, time, severity, description, ...}",
+        "summary": "counts by severity and type"
+      },
+      "example_cli": "python vcd_analyzer.py anomaly-detect sim.vcd --json"
+    }
+  ]
+}
