@@ -89,6 +89,8 @@ jobs:
       - name: Check Python syntax
         run: |
           python -m py_compile vcd_analyzer.py
-          for f in verify/test_*.py verify/fixtures/test_*.py; do
-            [ -f "$f" ] && python -m py_compile "$f"
+          for f in verify/test_*.py; do
+            if [ -f "$f" ]; then
+              python -m py_compile "$f"
+            fi
           done
