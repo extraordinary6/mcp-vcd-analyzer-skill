@@ -32,59 +32,73 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Pydantic is required by LangChain so it's safe to import unconditionally.
-# We support both pydantic v1 and v2 by importing from langchain's compat
-# shim if available, else falling back to plain pydantic.
+# Pydantic is required by LangChain at runtime, but we still guard the
+# import so this module can be loaded for schema introspection / docs /
+# tooling without pydantic installed. If the import fails, the schema
+# classes below remain undefined and `build_tools()` raises a clear
+# ImportError pointing the user at the install command.
+_PYDANTIC_AVAILABLE = True
+_PYDANTIC_IMPORT_ERROR = None
 try:
     from langchain_core.pydantic_v1 import BaseModel, Field  # pydantic v1 shim
 except ImportError:
     try:
         from pydantic.v1 import BaseModel, Field  # pydantic v2 with v1 shim
     except ImportError:
-        from pydantic import BaseModel, Field  # plain pydantic (any version)
+        try:
+            from pydantic import BaseModel, Field  # plain pydantic (any version)
+        except ImportError as e:
+            _PYDANTIC_AVAILABLE = False
+            _PYDANTIC_IMPORT_ERROR = e
+            BaseModel = None  # type: ignore[assignment]
+            Field = None  # type: ignore[assignment]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VCD_ANALYZER = REPO_ROOT / 'vcd_analyzer.py'
 
 
 # ----- Pydantic input schemas mirror the manifest input_schema for each Skill -----
+# Defined only when pydantic is importable; otherwise these names remain absent
+# and the build_tools() factory raises a clear ImportError.
 
-class ProtocolDecodeInput(BaseModel):
-    file: str = Field(description="Path to VCD file")
-    protocol: str = Field(description="Protocol type: axi4, apb, uart, or spi")
-    signals: Optional[str] = Field(default=None,
-        description="Signal pattern (substring/glob), e.g. 'm_axi_*' or 's_apb_*'")
-    begin: Optional[str] = Field(default=None, description="Start time, e.g. 100ns")
-    end: Optional[str] = Field(default=None, description="End time")
+if _PYDANTIC_AVAILABLE:
 
-
-class FSMTraceInput(BaseModel):
-    file: str = Field(description="Path to VCD file")
-    state: str = Field(description="Signal pattern resolving to exactly one state signal")
-    stuck_threshold: Optional[str] = Field(default=None,
-        description="Duration above which a state is reported stuck (default 100us)")
-    begin: Optional[str] = Field(default=None)
-    end: Optional[str] = Field(default=None)
+    class ProtocolDecodeInput(BaseModel):
+        file: str = Field(description="Path to VCD file")
+        protocol: str = Field(description="Protocol type: axi4, apb, uart, or spi")
+        signals: Optional[str] = Field(default=None,
+            description="Signal pattern (substring/glob), e.g. 'm_axi_*' or 's_apb_*'")
+        begin: Optional[str] = Field(default=None, description="Start time, e.g. 100ns")
+        end: Optional[str] = Field(default=None, description="End time")
 
 
-class CausalityInput(BaseModel):
-    file: str = Field(description="Path to VCD file")
-    effect: str = Field(description="Effect signal pattern (exactly one match)")
-    at: str = Field(description="Time when the effect was observed, e.g. '17.5us'")
-    window: Optional[str] = Field(default=None,
-        description="Search window before --at (default 100ns)")
+    class FSMTraceInput(BaseModel):
+        file: str = Field(description="Path to VCD file")
+        state: str = Field(description="Signal pattern resolving to exactly one state signal")
+        stuck_threshold: Optional[str] = Field(default=None,
+            description="Duration above which a state is reported stuck (default 100us)")
+        begin: Optional[str] = Field(default=None)
+        end: Optional[str] = Field(default=None)
 
 
-class AnomalyDetectInput(BaseModel):
-    file: str = Field(description="Path to VCD file")
-    filter: Optional[str] = Field(default=None,
-        description="Restrict analysis to matching signals")
-    begin: Optional[str] = Field(default=None)
-    end: Optional[str] = Field(default=None)
-    stuck_threshold: Optional[str] = Field(default=None,
-        description="Default: 50%% of analysis window or 100us")
-    glitch_threshold: Optional[str] = Field(default=None,
-        description="Default: 5ns")
+    class CausalityInput(BaseModel):
+        file: str = Field(description="Path to VCD file")
+        effect: str = Field(description="Effect signal pattern (exactly one match)")
+        at: str = Field(description="Time when the effect was observed, e.g. '17.5us'")
+        window: Optional[str] = Field(default=None,
+            description="Search window before --at (default 100ns)")
+
+
+    class AnomalyDetectInput(BaseModel):
+        file: str = Field(description="Path to VCD file")
+        filter: Optional[str] = Field(default=None,
+            description="Restrict analysis to matching signals")
+        begin: Optional[str] = Field(default=None)
+        end: Optional[str] = Field(default=None)
+        stuck_threshold: Optional[str] = Field(default=None,
+            description="Default: 50%% of analysis window or 100us")
+        glitch_threshold: Optional[str] = Field(default=None,
+            description="Default: 5ns")
 
 
 # ----- Shared runner: build CLI, run, parse envelope -----
@@ -146,6 +160,12 @@ def build_tools():
     Lazy-imports langchain_core so module import doesn't require LangChain
     to be installed.
     """
+    if not _PYDANTIC_AVAILABLE:
+        raise ImportError(
+            "pydantic is required to build LangChain tools. "
+            "Install with: pip install pydantic langchain-core "
+            "(original import error: {})".format(_PYDANTIC_IMPORT_ERROR)
+        )
     try:
         from langchain_core.tools import BaseTool
     except ImportError as e:

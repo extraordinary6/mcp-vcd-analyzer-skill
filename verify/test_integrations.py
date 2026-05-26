@@ -150,9 +150,23 @@ class OpenAIExecutorTests(unittest.TestCase):
         self.assertIn('axi4', envelope['error']['details']['supported'])
 
 
-# ----- LangChain Pydantic schemas (pydantic is broadly available) -----
+# ----- LangChain Pydantic schemas (pydantic optional in CI) -----
 
 class LangChainSchemaTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Pydantic is broadly available in real LangChain installs but is
+        # not in the lightweight CI matrix, so skip cleanly if absent.
+        try:
+            import pydantic  # noqa: F401
+        except ImportError:
+            try:
+                import pydantic.v1  # noqa: F401
+            except ImportError:
+                raise unittest.SkipTest(
+                    "pydantic not installed; LangChain schema tests skipped"
+                )
+
     def test_input_schemas_have_required_fields(self):
         from vcd_integrations.langchain_tools import (
             ProtocolDecodeInput, FSMTraceInput, CausalityInput, AnomalyDetectInput,

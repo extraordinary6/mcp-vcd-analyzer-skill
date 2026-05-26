@@ -32,11 +32,15 @@ jobs:
           pip install pytest
 
       - name: Install optional adapter dependencies
-        # Flask powers the REST API tests; we deliberately do NOT install
-        # mcp / openai / langchain — the Phase 3 test suite verifies the
+        # Flask powers the REST API tests; pydantic powers the LangChain
+        # schema tests. We deliberately do NOT install mcp / openai /
+        # langchain themselves — the Phase 3 test suite verifies the
         # adapters can be loaded and exercised without them via subprocess.
+        # langchain_tools.py also has a runtime fallback for the case when
+        # pydantic is absent, but installing it here lets the schema tests
+        # actually run rather than skip.
         run: |
-          pip install flask
+          pip install flask pydantic
 
       - name: Run core regression suite (verify/)
         run: |
