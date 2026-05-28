@@ -39,9 +39,11 @@ class MCPHelpersTests(unittest.TestCase):
         from _helpers import manifest_to_tool_metadata
         manifest = _load_manifest()
         tools = manifest_to_tool_metadata(manifest)
-        self.assertEqual(len(tools), 4)
+        self.assertEqual(len(tools), 11)
         names = {t['name'] for t in tools}
         self.assertEqual(names, {
+            'vcd_info', 'vcd_list', 'vcd_dump', 'vcd_summary',
+            'vcd_snapshot', 'vcd_compare', 'vcd_search',
             'vcd_protocol_decode', 'vcd_fsm_trace',
             'vcd_causality', 'vcd_anomaly_detect',
         })
@@ -77,6 +79,34 @@ class MCPHelpersTests(unittest.TestCase):
         self.assertIn('--state', cli)
         self.assertIn('fsm_state', cli)
 
+    def test_build_cli_args_supports_basic_query_flags(self):
+        """The 7 basic queries depend on --condition / --show / --changed flags
+        that didn't exist when Phase 3 first shipped. Make sure the adapter
+        glue passes them through."""
+        from _helpers import build_cli_args
+        cli = build_cli_args('search', {
+            'file': 'sim.vcd', 'condition': 'valid=1', 'show': 'data',
+            'changed': 'data', 'begin': '0ns', 'end': '100ns',
+        })
+        self.assertIn('--condition', cli)
+        self.assertIn('valid=1', cli)
+        self.assertIn('--show', cli)
+        self.assertIn('data', cli)
+        self.assertIn('--changed', cli)
+
+    def test_basic_query_invocation_round_trip(self):
+        """End-to-end: build_cli_args -> vcd_analyzer.py -> envelope."""
+        import json as _json
+        import subprocess
+        from _helpers import build_cli_args
+        cli = build_cli_args('info', {'file': str(FIXTURES_DIR / 'basic_trace.vcd')})
+        result = subprocess.run(cli, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        envelope = _json.loads(result.stdout)
+        self.assertEqual(envelope['status'], 'success')
+        self.assertEqual(envelope['skill'], 'info')
+        self.assertIn('signal_count', envelope['result'])
+
 
 # ----- OpenAI functions.json sync with manifest -----
 
@@ -102,7 +132,7 @@ class OpenAIArtifactsTests(unittest.TestCase):
         functions_path = REPO_ROOT / 'vcd_integrations' / 'openai' / 'functions.json'
         with open(functions_path, 'r', encoding='utf-8') as f:
             tools = json.load(f)
-        self.assertEqual(len(tools), 4)
+        self.assertEqual(len(tools), 11)
         for tool in tools:
             self.assertEqual(tool['type'], 'function')
             f = tool['function']
@@ -149,6 +179,16 @@ class OpenAIExecutorTests(unittest.TestCase):
         # The error details list the supported protocols — propagated unchanged
         self.assertIn('axi4', envelope['error']['details']['supported'])
 
+    def test_execute_basic_query_returns_envelope(self):
+        """OpenAI executor must work for the 7 newly registered basic queries."""
+        from vcd_integrations.openai.executor import execute_function_call
+        envelope = execute_function_call('vcd_info', {
+            'file': str(FIXTURES_DIR / 'basic_trace.vcd'),
+        })
+        self.assertEqual(envelope['status'], 'success')
+        self.assertEqual(envelope['skill'], 'info')
+        self.assertIn('signal_count', envelope['result'])
+
 
 # ----- LangChain Pydantic schemas (pydantic optional in CI) -----
 
@@ -183,6 +223,29 @@ class LangChainSchemaTests(unittest.TestCase):
             self.assertTrue(expected_required.issubset(required),
                              "{}: required={} missing some of {}".format(
                                  cls.__name__, required, expected_required))
+
+    def test_manifest_driven_basic_query_schemas(self):
+        """The 7 basic queries must produce schemas with the manifest-declared
+        required fields when the LangChain adapter builds models dynamically."""
+        from vcd_integrations.langchain_tools import _build_pydantic_model, _load_manifest
+        manifest = _load_manifest()
+        expected = {
+            'info': {'file'},
+            'list': {'file'},
+            'dump': {'file'},
+            'summary': {'file'},
+            'snapshot': {'file', 'at'},
+            'compare': {'file', 'at'},
+            'search': {'file', 'condition'},
+        }
+        skills_by_name = {c['skill']: c for c in manifest['capabilities']}
+        for skill, expected_required in expected.items():
+            cap = skills_by_name[skill]
+            model = _build_pydantic_model(skill, cap['input_schema'])
+            schema = model.schema() if hasattr(model, 'schema') else model.model_json_schema()
+            required = set(schema.get('required', []))
+            self.assertEqual(required, expected_required,
+                              "{}: required={} expected={}".format(skill, required, expected_required))
 
 
 # ----- REST API logic (Flask is only needed for the HTTP routes themselves) -----
@@ -242,6 +305,16 @@ class RestApiLogicTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         envelope = resp.get_json()
         self.assertEqual(envelope['status'], 'success')
+
+        # POST shortcut for one of the basic queries
+        resp = client.post('/api/v1/info', json={
+            'file': str(FIXTURES_DIR / 'basic_trace.vcd'),
+        })
+        self.assertEqual(resp.status_code, 200)
+        envelope = resp.get_json()
+        self.assertEqual(envelope['status'], 'success')
+        self.assertEqual(envelope['skill'], 'info')
+        self.assertIn('signal_count', envelope['result'])
 
 
 if __name__ == '__main__':

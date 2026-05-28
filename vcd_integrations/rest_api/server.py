@@ -55,6 +55,9 @@ _FLAG_MAP = {
     'at': '--at',
     'window': '--window',
     'filter': '--filter',
+    'condition': '--condition',
+    'show': '--show',
+    'changed': '--changed',
 }
 
 
@@ -148,8 +151,10 @@ def create_app():
         return jsonify(envelope)
 
     # Convenience shortcuts (also kept stable for clients that pre-date the
-    # generic /skills/<name> route).
-    for command in ('protocol-decode', 'fsm-trace', 'causality', 'anomaly-detect'):
+    # generic /skills/<name> route). One shortcut per Skill in the manifest.
+    manifest = _load_manifest()
+    for cap in manifest['capabilities']:
+        command = cap['command']
         def _make(command=command):
             def handler():
                 payload = request.get_json(silent=True) or {}

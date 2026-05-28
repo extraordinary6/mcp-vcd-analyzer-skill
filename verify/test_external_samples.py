@@ -17,7 +17,8 @@ def test_checked_in_external_samples_parse(name, min_signals):
     info = run_cli(['--json', 'info', p])
     assert info.returncode == 0, info.stderr
     obj = json.loads(info.stdout)
-    assert obj['signal_count'] >= min_signals
+    # Skill envelope wraps the legacy payload under ['result']
+    assert obj['result']['signal_count'] >= min_signals
     dump = run_cli(['--json', '--limit', '5', 'dump', p])
     assert dump.returncode == 0, dump.stderr
-    assert 'events' in json.loads(dump.stdout)
+    assert 'events' in json.loads(dump.stdout)['result']

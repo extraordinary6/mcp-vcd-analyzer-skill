@@ -93,6 +93,13 @@ jobs:
       - name: Verify CLI help works
         run: |
           python vcd_analyzer.py --help
+          python vcd_analyzer.py info --help
+          python vcd_analyzer.py list --help
+          python vcd_analyzer.py dump --help
+          python vcd_analyzer.py summary --help
+          python vcd_analyzer.py snapshot --help
+          python vcd_analyzer.py compare --help
+          python vcd_analyzer.py search --help
           python vcd_analyzer.py protocol-decode --help
           python vcd_analyzer.py fsm-trace --help
           python vcd_analyzer.py causality --help
@@ -101,6 +108,15 @@ jobs:
       - name: Verify Skill manifest commands work
         run: |
           python vcd_analyzer.py --skill-manifest > /dev/null
+          # Basic queries (Phase 3.5)
+          python vcd_analyzer.py --skill-info info > /dev/null
+          python vcd_analyzer.py --skill-info list > /dev/null
+          python vcd_analyzer.py --skill-info dump > /dev/null
+          python vcd_analyzer.py --skill-info summary > /dev/null
+          python vcd_analyzer.py --skill-info snapshot > /dev/null
+          python vcd_analyzer.py --skill-info compare > /dev/null
+          python vcd_analyzer.py --skill-info search > /dev/null
+          # Advanced Skills (Phase 1)
           python vcd_analyzer.py --skill-info protocol_decode > /dev/null
           python vcd_analyzer.py --skill-info fsm_trace > /dev/null
           python vcd_analyzer.py --skill-info causality > /dev/null

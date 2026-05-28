@@ -169,7 +169,10 @@ def test_skill_manifest_full():
     assert 'error_codes' in manifest
 
     skill_names = {c['skill'] for c in manifest['capabilities']}
-    assert skill_names == {'protocol_decode', 'fsm_trace', 'causality', 'anomaly_detect'}
+    assert skill_names == {
+        'info', 'list', 'dump', 'summary', 'snapshot', 'compare', 'search',
+        'protocol_decode', 'fsm_trace', 'causality', 'anomaly_detect',
+    }
 
     # Each capability has the expected shape
     for cap in manifest['capabilities']:
@@ -220,6 +223,109 @@ def test_manifest_error_codes_match_implementation():
     print("[PASS] Manifest documents all known error codes")
 
 
+# ----- Basic-query envelope tests (info / list / dump / summary / snapshot / compare / search) -----
+
+def test_info_envelope():
+    envelope = _run([
+        sys.executable, str(VCD_ANALYZER), 'info',
+        str(FIXTURES_DIR / 'basic_trace.vcd'), '--json',
+    ])
+    _success_envelope_shape(envelope)
+    assert envelope['skill'] == 'info'
+    # Legacy fields still present, just nested under result
+    assert 'signal_count' in envelope['result']
+    print("[PASS] info emits standardized success envelope")
+
+
+def test_list_envelope():
+    envelope = _run([
+        sys.executable, str(VCD_ANALYZER), 'list',
+        str(FIXTURES_DIR / 'basic_trace.vcd'),
+        '--filter', 'clk', '--json',
+    ])
+    _success_envelope_shape(envelope)
+    assert envelope['skill'] == 'list'
+    assert 'signals' in envelope['result']
+    # --filter is normalized into a pattern list at argparse time
+    assert 'clk' in envelope['input']['filter']
+    print("[PASS] list emits standardized success envelope")
+
+
+def test_dump_envelope():
+    envelope = _run([
+        sys.executable, str(VCD_ANALYZER), 'dump',
+        str(FIXTURES_DIR / 'basic_trace.vcd'),
+        '--begin', '0ns', '--end', '30ns', '--json',
+    ])
+    _success_envelope_shape(envelope)
+    assert envelope['skill'] == 'dump'
+    assert 'events' in envelope['result']
+    print("[PASS] dump emits standardized success envelope")
+
+
+def test_summary_envelope():
+    envelope = _run([
+        sys.executable, str(VCD_ANALYZER), 'summary',
+        str(FIXTURES_DIR / 'basic_trace.vcd'),
+        '--begin', '0ns', '--end', '30ns', '--json',
+    ])
+    _success_envelope_shape(envelope)
+    assert envelope['skill'] == 'summary'
+    assert 'window' in envelope['result']
+    assert 'rows' in envelope['result']
+    print("[PASS] summary emits standardized success envelope")
+
+
+def test_snapshot_envelope():
+    envelope = _run([
+        sys.executable, str(VCD_ANALYZER), 'snapshot',
+        str(FIXTURES_DIR / 'basic_trace.vcd'),
+        '--at', '20ns', '--json',
+    ])
+    _success_envelope_shape(envelope)
+    assert envelope['skill'] == 'snapshot'
+    assert envelope['input']['at'] == '20ns'
+    assert 'signals' in envelope['result']
+    print("[PASS] snapshot emits standardized success envelope")
+
+
+def test_compare_envelope():
+    envelope = _run([
+        sys.executable, str(VCD_ANALYZER), 'compare',
+        str(FIXTURES_DIR / 'basic_trace.vcd'),
+        '--at', '10ns,30ns', '--json',
+    ])
+    _success_envelope_shape(envelope)
+    assert envelope['skill'] == 'compare'
+    assert 'diffs' in envelope['result']
+    print("[PASS] compare emits standardized success envelope")
+
+
+def test_search_envelope():
+    envelope = _run([
+        sys.executable, str(VCD_ANALYZER), 'search',
+        str(FIXTURES_DIR / 'search_trace.vcd'),
+        '--condition', 'tb.valid=1,tb.ready=1',
+        '--begin', '0ns', '--end', '100ns', '--json',
+    ])
+    _success_envelope_shape(envelope)
+    assert envelope['skill'] == 'search'
+    assert envelope['result']['mode'] in ('interval', 'segment', 'event')
+    print("[PASS] search emits standardized success envelope")
+
+
+def test_compare_invalid_at_returns_error_envelope():
+    """compare's '--at' must be exactly two comma-separated times — bad input
+    should surface a structured INVALID_TIME_RANGE error envelope."""
+    envelope = _run([
+        sys.executable, str(VCD_ANALYZER), 'compare',
+        str(FIXTURES_DIR / 'basic_trace.vcd'),
+        '--at', '10ns', '--json',
+    ], expect_failure=True)
+    _error_envelope_shape(envelope, expected_code='INVALID_TIME_RANGE')
+    print("[PASS] compare INVALID_TIME_RANGE error envelope")
+
+
 if __name__ == '__main__':
     print("Running Phase 2 (skill envelope / manifest / error) tests...\n")
 
@@ -237,5 +343,15 @@ if __name__ == '__main__':
     test_skill_info_by_name()
     test_skill_info_unknown_name()
     test_manifest_error_codes_match_implementation()
+
+    # Phase 3.5: basic CLI queries promoted to standard Skill envelope
+    test_info_envelope()
+    test_list_envelope()
+    test_dump_envelope()
+    test_summary_envelope()
+    test_snapshot_envelope()
+    test_compare_envelope()
+    test_search_envelope()
+    test_compare_invalid_at_returns_error_envelope()
 
     print("\n[SUCCESS] All Phase 2 envelope/manifest tests passed!")

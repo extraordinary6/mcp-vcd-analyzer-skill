@@ -11,7 +11,7 @@ def test_cli_main_error_and_sigpipe_safe(tmp_path):
     assert 'Error:' in r.stderr
     ok = run_cli(['--json', 'info', p])
     assert ok.returncode == 0
-    assert json.loads(ok.stdout)['signal_count'] == 1
+    assert json.loads(ok.stdout)['result']['signal_count'] == 1
 
 
 def test_external_vcd_directory_smoke_is_optional(tmp_path):

@@ -26,6 +26,9 @@ _FLAG_MAP = {
     'at': '--at',
     'window': '--window',
     'filter': '--filter',
+    'condition': '--condition',
+    'show': '--show',
+    'changed': '--changed',
 }
 
 

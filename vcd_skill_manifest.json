@@ -43,6 +43,170 @@
   ],
   "capabilities": [
     {
+      "skill": "info",
+      "command": "info",
+      "description": "Inspect a VCD file's metadata: timescale, signal count, scope list, time span, and tool provenance. Lowest-cost first call to ground any downstream analysis.",
+      "category": "basic_query",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file": {"type": "string", "description": "Path to VCD file"}
+        },
+        "required": ["file"]
+      },
+      "result_schema": {
+        "file": "absolute path",
+        "size_bytes": "file size",
+        "timescale": "human-readable timescale (e.g. '1ns')",
+        "signal_count": "int",
+        "time_min": "human-readable earliest event time",
+        "time_max": "human-readable latest event time",
+        "duration": "max - min",
+        "scopes": "list of declared scope paths"
+      },
+      "example_cli": "python vcd_analyzer.py info sim.vcd --json"
+    },
+    {
+      "skill": "list",
+      "command": "list",
+      "description": "List signals declared in a VCD file, optionally filtered by a glob/substring pattern. Returns paths, widths, and types.",
+      "category": "basic_query",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":   {"type": "string", "description": "Path to VCD file"},
+          "filter": {"type": "string", "description": "Comma-separated substring/glob patterns (case-insensitive)"}
+        },
+        "required": ["file"]
+      },
+      "result_schema": {
+        "total": "int — total matched",
+        "shown": "int — entries returned (after --limit)",
+        "truncated": "bool",
+        "signals": "array of {path, width, type}"
+      },
+      "example_cli": "python vcd_analyzer.py list sim.vcd --filter axi --json"
+    },
+    {
+      "skill": "dump",
+      "command": "dump",
+      "description": "Stream value-change events in time order. Filter by signal pattern and time range.",
+      "category": "basic_query",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":   {"type": "string"},
+          "filter": {"type": "string", "description": "Comma-separated substring/glob patterns"},
+          "begin":  {"type": "string", "description": "Start time (e.g. 100ns, 17.5us)"},
+          "end":    {"type": "string", "description": "End time"}
+        },
+        "required": ["file"]
+      },
+      "result_schema": {
+        "shown": "int — events returned",
+        "truncated": "bool",
+        "events": "array of {time, time_ticks, time_h, path, value}"
+      },
+      "example_cli": "python vcd_analyzer.py dump sim.vcd --begin 100ns --end 200ns --filter clk --json"
+    },
+    {
+      "skill": "summary",
+      "command": "summary",
+      "description": "Aggregate per-signal statistics over a time window: classify signals as active/static/undefined, with rise/fall counts and first/last change.",
+      "category": "basic_query",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":   {"type": "string"},
+          "filter": {"type": "string"},
+          "begin":  {"type": "string"},
+          "end":    {"type": "string"}
+        },
+        "required": ["file"]
+      },
+      "result_schema": {
+        "window": "{begin, end}",
+        "selected": "int",
+        "defined": "int",
+        "undefined": "int",
+        "active": "int",
+        "static": "int",
+        "rows": "array of per-signal stat objects"
+      },
+      "example_cli": "python vcd_analyzer.py summary sim.vcd --begin 0 --end 1ms --filter axi --json"
+    },
+    {
+      "skill": "snapshot",
+      "command": "snapshot",
+      "description": "Return known signal values at a specific time point. Useful for grounding causality questions ('what was the state at the failure time?').",
+      "category": "basic_query",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":   {"type": "string"},
+          "at":     {"type": "string", "description": "Time point (e.g. 17.55us)"},
+          "filter": {"type": "string"}
+        },
+        "required": ["file", "at"]
+      },
+      "result_schema": {
+        "at": "human-readable time",
+        "selected": "int",
+        "known": "int",
+        "undefined": "int",
+        "signals": "array of {path, value}"
+      },
+      "example_cli": "python vcd_analyzer.py snapshot sim.vcd --at 17.55us --json"
+    },
+    {
+      "skill": "compare",
+      "command": "compare",
+      "description": "Diff known signal values between two time points; ideal for before/after triage of a state change.",
+      "category": "basic_query",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":   {"type": "string"},
+          "at":     {"type": "string", "description": "Two times separated by comma, e.g. '17.5us,17.7us'"},
+          "filter": {"type": "string"}
+        },
+        "required": ["file", "at"]
+      },
+      "result_schema": {
+        "t1": "first time",
+        "t2": "second time",
+        "total": "int — changed signals",
+        "diffs": "array of {path, at_t1, at_t2}"
+      },
+      "example_cli": "python vcd_analyzer.py compare sim.vcd --at 17.5us,17.7us --json"
+    },
+    {
+      "skill": "search",
+      "command": "search",
+      "description": "Conditional search over a time window. Returns intervals where the conjunction of equality predicates (e.g. 'valid=1,ready=1') holds, or events when a watched signal changes inside that window.",
+      "category": "basic_query",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "file":      {"type": "string"},
+          "condition": {"type": "string", "description": "Comma-separated AND conditions; e.g. 'valid=1,ready=1'. != also supported."},
+          "show":      {"type": "string", "description": "Comma-separated signals to observe while the condition holds; segments split when shown values change"},
+          "changed":   {"type": "string", "description": "Emit events only when this signal really changes (must resolve to exactly one)"},
+          "begin":     {"type": "string"},
+          "end":       {"type": "string"}
+        },
+        "required": ["file", "condition"]
+      },
+      "result_schema": {
+        "mode": "'interval' | 'segment' | 'event'",
+        "condition": "echo of the input condition",
+        "intervals": "(interval mode) array of {begin_ticks, end_ticks}",
+        "segments":  "(segment mode) array of intervals enriched with show values",
+        "events":    "(event mode) array of {time_ticks, time_h, values}"
+      },
+      "example_cli": "python vcd_analyzer.py search sim.vcd --condition 'valid=1,ready=1' --show data --json"
+    },
+    {
       "skill": "protocol_decode",
       "command": "protocol-decode",
       "description": "Decode bus protocol transactions (AXI4 / APB / UART / SPI). Returns transactions, protocol violations, and performance statistics.",

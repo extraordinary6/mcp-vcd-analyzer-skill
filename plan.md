@@ -1,11 +1,18 @@
 # VCD Analyzer - AI Agent Skill Interface 升级计划
 
-## Phase 1 + Phase 2 + Phase 3 完成状态总结 (2026-05-27)
+## Phase 1 + Phase 2 + Phase 3 完成状态总结 (2026-05-28)
 
-**所有 4 个核心 Skill + 标准化接口 + 4 个 Agent 适配器已上线**：
+**所有 11 个 Skill + 标准化接口 + 4 个 Agent 适配器已上线**：
 
 | 模块 | 命令/入口 | 状态 | 测试数 |
 |------|-----------|------|--------|
+| Basic Query (info) | `info` | ✅ 完成 | 1 envelope |
+| Basic Query (list) | `list` | ✅ 完成 | 1 envelope |
+| Basic Query (dump) | `dump` | ✅ 完成 | 1 envelope |
+| Basic Query (summary) | `summary` | ✅ 完成 | 1 envelope |
+| Basic Query (snapshot) | `snapshot` | ✅ 完成 | 1 envelope |
+| Basic Query (compare) | `compare` | ✅ 完成 | 1 envelope + 1 error |
+| Basic Query (search) | `search` | ✅ 完成 | 1 envelope |
 | Protocol Decode (AXI4) | `protocol-decode --protocol axi4` | ✅ 完成 | 1 |
 | Protocol Decode (APB) | `protocol-decode --protocol apb` | ✅ 完成 | 3 |
 | Protocol Decode (UART) | `protocol-decode --protocol uart` | ✅ 完成 | 2 |
@@ -14,27 +21,26 @@
 | Causality Analysis | `causality` | ✅ 完成 | 7 |
 | Anomaly Detection | `anomaly-detect` | ✅ 完成 | 10 |
 | Skill Envelope / Manifest / Error | `--skill-manifest`, `--skill-info` | ✅ 完成 | 12 |
-| **MCP Server** | `vcd_integrations/mcp/server.py` | ✅ 完成 | 3 |
-| **OpenAI Function Calling** | `vcd_integrations/openai/` | ✅ 完成 | 5 |
-| **LangChain Tools** | `vcd_integrations/langchain_tools.py` | ✅ 完成 | 1 |
-| **REST API** | `vcd_integrations/rest_api/server.py` | ✅ 完成 | 3 |
+| **MCP Server** | `vcd_integrations/mcp/server.py` | ✅ 完成 | 4 |
+| **OpenAI Function Calling** | `vcd_integrations/openai/` | ✅ 完成 | 6 |
+| **LangChain Tools** | `vcd_integrations/langchain_tools.py` | ✅ 完成 | 2 |
+| **REST API** | `vcd_integrations/rest_api/server.py` | ✅ 完成 | 4 |
 
-**总测试数**：pytest 收集 **98 个测试，全部通过**
-- 36 个核心回归测试
-- 33 个 Phase 1 skill 测试
-- 12 个 Phase 2 envelope/manifest 测试
-- 12 个 Phase 3 adapter 测试
-- 5 个 external sample 测试
+**总测试数**：pytest 收集 **110 个测试，全部通过**
 
-**Phase 3 新增能力**:
-- **MCP Server**: 为 Claude Desktop / Claude Code / Continue 等 MCP 客户端提供 stdio 工具
-- **OpenAI Functions**: GPT-4o/Claude/Gemini 等 LLM 都能用的 function-calling schemas
-- **LangChain Tools**: `BaseTool` 子类，可直接接入 `create_tool_calling_agent`
-- **REST API**: Flask HTTP/JSON 接口，跨语言、跨进程调用都支持
-- 所有 adapter 都从 `vcd_skill_manifest.json` 派生工具元数据，**零硬编码**
-
-**CI 集成**：GitHub Actions 矩阵测试（Ubuntu/Windows/macOS × Python 3.9-3.12）
-+ Skill manifest CLI 验证 + adapter syntax check + OpenAI functions.json 漂移检测
+**Phase 3.5 (2026-05-28) — 把基础 CLI 查询统一升级为 Skill**:
+- 7 个基础命令（info / list / dump / summary / snapshot / compare / search）现在
+  也走标准 envelope（status / skill / execution_time_ms / input / result /
+  metadata / suggestions），跟 4 个高级 Skill 完全一致
+- `vcd_skill_manifest.json` 从 4 capabilities 扩展到 **11 capabilities**，新增
+  分类 `basic_query`
+- `_FLAG_MAP` 在 4 个 adapter（MCP / OpenAI / REST / LangChain）里都加了
+  `--condition` / `--show` / `--changed`
+- **LangChain adapter 重构成 manifest 驱动**：用 `pydantic.create_model` 动态
+  从 manifest 的 `input_schema` 派生 BaseTool 子类，新增 Skill 时零代码改动；
+  4 个旧的 Pydantic schema class 名作为别名保留，向后兼容
+- REST API 的 shortcut endpoints 自动覆盖所有 11 个 Skill
+- OpenAI `functions.json` 重新生成，11 个 tools
 
 ---
 

@@ -13,7 +13,7 @@ FIX_HANDSHAKE = ROOT / "verify" / "fixtures" / "handshake_trace.vcd"
 FIX_BUS_RANGE = ROOT / "verify" / "fixtures" / "bus_range_trace.vcd"
 FIX_ESCAPED = ROOT / "verify" / "fixtures" / "escaped_trace.vcd"
 
-VERSION = "1.3.9"
+VERSION = "2.0.0"
 LEGACY_SEARCH = False
 SUPPORTS_EDGES = False
 SUPPORTS_HANDSHAKE = False
@@ -51,7 +51,17 @@ def run_json(*args):
 def extract_rows(obj, key):
     if isinstance(obj, list):
         return obj
+    # Skill envelope: rows live under obj["result"]
+    if isinstance(obj, dict) and "result" in obj and isinstance(obj["result"], dict):
+        return obj["result"].get(key, [])
     return obj.get(key, [])
+
+
+def _payload(obj):
+    """Unwrap the Skill envelope's `result` payload if present."""
+    if isinstance(obj, dict) and "result" in obj and isinstance(obj["result"], dict):
+        return obj["result"]
+    return obj
 
 def expect_ok(*args):
     result = run_cli(*args)
@@ -69,6 +79,7 @@ class TestCLI(unittest.TestCase):
 
     def test_info_and_list(self):
         info = run_json("--json", "info", FIX_BASIC)
+        info = _payload(info)
         self.assertEqual(info["signal_count"], 5)
         self.assertIn("tb", info.get("scopes", []))
 
@@ -112,7 +123,7 @@ class TestCLI(unittest.TestCase):
         dumped = run_json("dump", FIX_BASIC, "--begin", "0ns", "--end", "30ns", "--filter", "clk,state,data", "--json", "--limit", "1")
         rows = extract_rows(dumped, "events")
         self.assertEqual(len(rows), 1)
-        self.assertTrue(dumped.get("truncated"))
+        self.assertTrue(_payload(dumped).get("truncated"))
 
         result = expect_ok("summary", FIX_BASIC, "--begin", "0ns", "--end", "30ns", "--filter", "state,data", "--verbose")
         self.assertIn("tb.state", result.stdout)
@@ -158,8 +169,9 @@ class TestCLI(unittest.TestCase):
                 "--end",
                 "100ns",
             )
-            key = "segments" if "segments" in seg else "intervals"
-            rows = seg[key]
+            payload = _payload(seg)
+            key = "segments" if "segments" in payload else "intervals"
+            rows = payload[key]
             self.assertEqual([(r["begin_ticks"], r["end_ticks"]) for r in rows], [(20, 25), (25, 30)])
 
             changed = run_json(
@@ -175,7 +187,7 @@ class TestCLI(unittest.TestCase):
                 "--end",
                 "100ns",
             )
-            times = [row["time_ticks"] for row in changed["events"]]
+            times = [row["time_ticks"] for row in _payload(changed)["events"]]
             if SEARCH_T0_MAY_COUNT:
                 self.assertEqual(times, [0, 40, 60])
             else:
@@ -205,7 +217,7 @@ class TestCLI(unittest.TestCase):
 
         if SUPPORTS_SCOPE_FIX:
             info = run_json("--json", "info", FIX_ESCAPED)
-            self.assertEqual(info["scopes"], ["tb"])
+            self.assertEqual(_payload(info)["scopes"], ["tb"])
 
 
     def test_filter_normalize_rejects_non_sequence(self):
@@ -256,8 +268,8 @@ $enddefinitions $end
     def test_info_dump_agree_on_malformed_vector(self):
         tmp = self._tmp_vcd(self._base_vcd('$var wire 1 ! a $end\n', 'b1010\n#10\n1!\n'))
         try:
-            info = run_json("--json", "info", tmp)
-            dump = run_json("--json", "dump", tmp)
+            info = _payload(run_json("--json", "info", tmp))
+            dump = _payload(run_json("--json", "dump", tmp))
             self.assertEqual(info["time_max_ticks"], 10)
             self.assertEqual([e["time_ticks"] for e in dump["events"]], [10])
         finally:
@@ -268,8 +280,8 @@ $enddefinitions $end
         data = 'reset !\n#7\n1"\n'
         tmp = self._tmp_vcd(self._base_vcd(decls, data))
         try:
-            info = run_json("--json", "info", tmp)
-            dump = run_json("--json", "dump", tmp)
+            info = _payload(run_json("--json", "info", tmp))
+            dump = _payload(run_json("--json", "dump", tmp))
             self.assertEqual(info["time_max_ticks"], 7)
             self.assertEqual(dump["events"][0]["time_ticks"], 7)
         finally:
@@ -278,8 +290,8 @@ $enddefinitions $end
     def test_info_dump_agree_on_malformed_port(self):
         tmp = self._tmp_vcd(self._base_vcd('$var wire 1 ! p $end\n', 'pH #10 1!\n#20\n0!\n'))
         try:
-            info = run_json("--json", "info", tmp)
-            dump = run_json("--json", "dump", tmp)
+            info = _payload(run_json("--json", "info", tmp))
+            dump = _payload(run_json("--json", "dump", tmp))
             self.assertEqual(info["time_max_ticks"], 20)
             self.assertEqual([e["time_ticks"] for e in dump["events"]], [10, 20])
         finally:
@@ -288,8 +300,8 @@ $enddefinitions $end
     def test_valid_multichar_port_parses_both_info_and_dump(self):
         tmp = self._tmp_vcd(self._base_vcd('$var wire 2 ! data $end\n', '#0\npHL 0 6 !\n'))
         try:
-            info = run_json("--json", "info", tmp)
-            dump = run_json("--json", "dump", tmp)
+            info = _payload(run_json("--json", "info", tmp))
+            dump = _payload(run_json("--json", "dump", tmp))
             self.assertEqual(info["time_min_ticks"], 0)
             self.assertEqual(dump["events"][0]["value"], "2 (0x2)")
         finally:
